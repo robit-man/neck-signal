@@ -1,204 +1,252 @@
 #!/usr/bin/env python3
 """
-neck_agent.py  –  JWT-secured Socket.IO ⇄ Serial bridge
-
-• boots / re-uses  ag_venv/  (installs pyserial, requests, python-socketio)
-• remembers  server-URL  &  UUID  in  config.json
-• first run asks for the shared password (.env → PEER_SHARED_SECRET)
-• on serial-connect:
-      – prints an example of a *full* command
-      – sends HOME once
-• every incoming command from the UI:
-      – "home"  →  literal HOME
-      – partial  →  merged into full X,Y,Z,H,S,A,R,P and validated
+neck_agent.py  –  Socket.IO ⇄ Serial bridge + camera streamer (color+depth) with JWT
+────────────────────────────────────────────────────────────────────────────────────
+ • Creates / reuses  ag_venv/
+ • Persists signalling-server URL & UUID in config.json
+ • First run asks for the shared password (so it matches the UI)
+ • Streams camera frames:
+     - color: 1280x800 → resized & center-cropped to 640x360 → JPEG
+     - depth: 640x360  → mapped 16/12 bit → 8-bit → PNG
+ • Emits Socket.IO binary events: 'frame-color' and 'frame-depth'
 """
 
-###############################################################################
-# 0.  ▸▸▸  very light v-env bootstrap  ▸▸▸
-###############################################################################
 from __future__ import annotations
-import os, sys, subprocess, venv, json, secrets, argparse, time, platform, pathlib
+import os, sys, json, secrets, argparse, time, subprocess, pathlib, platform, venv, io, threading
 from typing import Optional
 from urllib.parse import urljoin
 
-ROOT      = pathlib.Path(__file__).resolve().parent
-VENV_DIR  = ROOT / "ag_venv"
-VENV_PY   = VENV_DIR / ("Scripts" if platform.system() == "Windows" else "bin") / "python"
-DEPS      = ["pyserial", "python-socketio[client]", "requests"]
+ROOT       = pathlib.Path(__file__).resolve().parent
+VENV_DIR   = ROOT / "ag_venv"
+VENV_PY    = VENV_DIR / ("Scripts" if platform.system() == "Windows" else "bin") / "python"
+CFG_PATH   = ROOT / "config.json"
+ENV_PATH   = ROOT / ".env"
 
-def in_venv() -> bool:
-    return sys.prefix != sys.base_prefix               # reliable for Py ≥3.4
+DEPS = ["pyserial", "python-socketio[client]", "requests", "Pillow", "numpy"]
 
-if not in_venv():
+# ───────── venv bootstrap ─────────
+def inside_venv() -> bool:
+    return pathlib.Path(sys.executable).resolve() == VENV_PY.resolve()
+
+def create_venv():
+    print("[agent] creating ag_venv …")
+    venv.EnvBuilder(with_pip=True).create(VENV_DIR)
+    subprocess.check_call([str(VENV_PY), "-m", "pip", "install", "--quiet", "--upgrade", "pip"])
+    subprocess.check_call([str(VENV_PY), "-m", "pip", "install", "--quiet", *DEPS])
+
+if not inside_venv():
     if not VENV_DIR.exists():
-        print("[agent] creating ag_venv …")
-        venv.EnvBuilder(with_pip=True).create(VENV_DIR)
-        subprocess.check_call([str(VENV_PY), "-m", "pip", "install",
-                               "--quiet", "--upgrade", "pip", *DEPS])
+        create_venv()
+    else:
+        # ensure deps inside venv
+        subprocess.check_call([str(VENV_PY), "-m", "pip", "install", "--quiet", "--upgrade", "pip"])
+        subprocess.check_call([str(VENV_PY), "-m", "pip", "install", "--quiet", *DEPS])
     os.execv(str(VENV_PY), [str(VENV_PY), *sys.argv])
 
-# inside the venv: make sure *all* deps are present (add later if user deletes)
-missing: list[str] = []
-for pkg, mod in [("pyserial", "serial"),
-                 ("requests", "requests"),
-                 ("python-socketio[client]", "socketio")]:
-    try: __import__(mod)
-    except ModuleNotFoundError: missing.append(pkg)
-if missing:
-    print("[agent] installing extra deps:", ", ".join(missing))
-    subprocess.check_call([sys.executable, "-m", "pip", "install",
-                           "--quiet", *missing])
-    os.execv(sys.executable, [sys.executable, *sys.argv])     # restart once
-
-###############################################################################
-# 1.  .env  and  config.json
-###############################################################################
-ENV_PATH = ROOT / ".env"
-CFG_PATH = ROOT / "config.json"
-
+# ───────── .env ─────────
 if not ENV_PATH.exists():
-    pw = input("Shared password (same you gave the UI) [blank=random]:\n> ").strip() \
-         or secrets.token_urlsafe(16)
-    ENV_PATH.write_text(f"PEER_SHARED_SECRET={pw}\n"
-                        f"JWT_SECRET={secrets.token_urlsafe(32)}\n")
+    print("[agent] first run – need shared password with signalling server")
+    pw = input("Shared password (same one you used in user_interface, blank=random):\n> ").strip()
+    shared_pw = pw or secrets.token_urlsafe(16)
+    ENV_PATH.write_text(
+        f"PEER_SHARED_SECRET={shared_pw}\n"
+        f"JWT_SECRET={secrets.token_urlsafe(32)}\n"
+    )
     print("[agent] wrote .env")
-
-for ln in ENV_PATH.read_text().splitlines():
-    if "=" in ln and not ln.lstrip().startswith("#"):
-        k,v = ln.split("=",1); os.environ.setdefault(k.strip(), v.strip())
+for line in ENV_PATH.read_text().splitlines():
+    if "=" in line and not line.lstrip().startswith("#"):
+        k, v = line.split("=", 1); os.environ.setdefault(k.strip(), v.strip())
 PEER_SECRET = os.environ["PEER_SHARED_SECRET"]
 
-cfg: dict = json.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
-
-ap = argparse.ArgumentParser()
-ap.add_argument("-s","--server-url")
-ap.add_argument("-u","--uuid")
+# ───────── config (server URL, UUID, camera URLs) ─────────
+cfg: dict[str, str] = json.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
+ap = argparse.ArgumentParser(description="neck_agent – Serial ↔ Socket.IO bridge + camera")
+ap.add_argument("-s", "--server-url", help="signalling server base URL")
+ap.add_argument("-u", "--uuid",       help="this agent's UUID")
+ap.add_argument("--color-url",        help="color frame URL (default http://127.0.0.1:8080/camera/rs_color)")
+ap.add_argument("--depth-url",        help="depth frame URL (default http://127.0.0.1:8080/camera/rs_depth)")
 cli = ap.parse_args()
 
-def ask(t:str)->str: return input(t).strip()
+def ask(prompt: str) -> str: return input(prompt).strip()
+server_url = (cli.server_url or cfg.get("server_url") or ask("Signalling server URL:\n> ")).rstrip("/")
+agent_uuid = (cli.uuid       or cfg.get("uuid")       or ask("Agent UUID (blank=random):\n> ")
+              or "-".join(secrets.token_hex(2) for _ in range(4)))
+color_url  = (cli.color_url or cfg.get("color_url") or "http://127.0.0.1:8080/camera/rs_color")
+depth_url  = (cli.depth_url or cfg.get("depth_url") or "http://127.0.0.1:8080/camera/rs_depth")
 
-SERVER = (cli.server_url or cfg.get("server_url") or ask("Server URL:\n> ")).rstrip("/")
-UUID   = (cli.uuid or cfg.get("uuid") or ask("Agent UUID [blank=random]:\n> ")
-          or "-".join(secrets.token_hex(2) for _ in range(4)))
-
-cfg.update(server_url=SERVER, uuid=UUID)
+cfg.update(server_url=server_url, uuid=agent_uuid, color_url=color_url, depth_url=depth_url)
 CFG_PATH.write_text(json.dumps(cfg, indent=4))
+print(f"[agent] config  →  server={server_url}   uuid={agent_uuid}")
+print(f"[agent] streams →  color={color_url}  depth={depth_url}")
 
-print(f"[agent]   server={SERVER}\n          uuid={UUID}")
+# ───────── heavy imports ─────────
+import requests, socketio, serial              # type: ignore
+import numpy as np
+from PIL import Image
 
-###############################################################################
-# 2.  heavy imports  (safe inside v-env)
-###############################################################################
-import requests, socketio, serial        # type: ignore
-
-###############################################################################
-# 3.  JWT login loop
-###############################################################################
-LOGIN_URL = urljoin(SERVER + "/", "login")
+# ───────── login loop ─────────
+LOGIN_URL = urljoin(server_url + "/", "login")
 def try_login() -> Optional[str]:
     try:
-        r = requests.post(LOGIN_URL, json={"uuid":UUID, "password":PEER_SECRET}, timeout=4)
-        if r.status_code == 200 and "token" in r.json(): return r.json()["token"]
-        print("[agent] /login →", r.status_code)
-    except Exception as e: print("[agent] /login unreachable:", e)
+        r = requests.post(LOGIN_URL, json={"uuid": agent_uuid, "password": PEER_SECRET}, timeout=4)
+        if r.status_code == 200 and "token" in r.json():
+            return r.json()["token"]
+        if r.status_code == 401: print("[agent] /login → bad credentials (server not aware yet)")
+    except Exception as e:
+        print(f"[agent] /login unreachable: {e}")
     return None
 
-token = None
-while token is None:
-    token = try_login() or (time.sleep(3) or None)
-print("[agent] JWT ✓")
+print(f"[agent] contacting {LOGIN_URL}")
+jwt_token: Optional[str] = None
+while jwt_token is None:
+    jwt_token = try_login()
+    if jwt_token is None: time.sleep(3)
+print("[agent] JWT acquired ✓")
 
-###############################################################################
-# 4.  serial connect (+ HOME once, example)
-###############################################################################
-SER_POSSIBLE = ["/dev/ttyUSB0","/dev/ttyUSB1","/dev/tty0","/dev/tty1","COM3","COM4"]
+# ───────── open Serial (retry) ─────────
+SER_CANDIDATES = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/tty0", "/dev/tty1", "COM3", "COM4"]
 ser: Optional[serial.Serial] = None
 while ser is None:
-    for p in SER_POSSIBLE:
+    for port in SER_CANDIDATES:
         try:
-            ser = serial.Serial(p, 115200, timeout=1)
-            print("[agent] opened serial:", p)
+            ser = serial.Serial(port, 115200, timeout=1)
+            print("[agent] opened serial port:", port)
             break
         except Exception:
             ser = None
     if ser is None:
-        print("[agent] no serial – retry in 3 s"); time.sleep(3)
+        print("[agent] no serial port – retry in 3 s")
+        time.sleep(3)
 
-# ▸▸ internal state / helpers  ──────────────────────────────────────────────
-ALLOWED = {
-    "X": (-700, 700, int), "Y": (-700, 700, int), "Z": (-700, 700, int),
-    "H": (0, 70, int),     "S": (0, 10, float),   "A": (0, 10, float),
-    "R": (-700, 700, int), "P": (-700, 700, int),
-}
-state = {k: (1.0 if k in ("S","A") else 0) for k in ALLOWED}
-
-def validate(cmd:str)->bool:
-    if cmd.lower()=="home": return True
-    seen=set()
-    for tok in cmd.split(","):
-        m = __import__("re").match(r"^([XYZHSARP])(-?\d+(?:\.\d+)?)$", tok.strip())
-        if not m or m.group(1) in seen: return False
-        k,val = m.group(1), m.group(2); low,high,cast = ALLOWED[k]
-        try: v=cast(val)
-        except: return False
-        if not low<=v<=high: return False
-        seen.add(k)
-    return True
-
-def merge(cmd:str)->str:
-    if cmd.lower()=="home":
-        for k in state: state[k]=1.0 if k in ("S","A") else 0
-        return "HOME"
-    for tok in cmd.split(","):
-        m = __import__("re").match(r"^([XYZHSARP])(-?\d+(?:\.\d+)?)$", tok.strip())
-        if m:
-            k,val=m.group(1),m.group(2); state[k]=ALLOWED[k][2](val)
-    return ",".join(f"{k}{state[k]}" for k in ["X","Y","Z","H","S","A","R","P"])
-
-# example + home
-print("[agent] example full cmd:  X100,Y-50,Z0,H30,S1,A1,R0,P0")
-ser.write(b"HOME\n"); print("[agent] → serial  HOME")
-
-###############################################################################
-# 5.  Socket.IO bridge (peer-message → serial)
-###############################################################################
-sio = socketio.Client(reconnection=True, reconnection_attempts=0)
+# ───────── Socket.IO bridge ─────────
+sio = socketio.Client(reconnection=True, reconnection_attempts=0)  # infinite tries
 
 @sio.event
 def connect():    print("[agent] WS connected")
 @sio.event
 def disconnect(): print("[agent] WS disconnected")
 
-def handle_cmd(raw:str):
-    if not validate(raw):
-        print("[agent] ✗ invalid:", raw); return
-    full = merge(raw)
-    try:
-        ser.write((full+"\n").encode())
-        print(f"[agent] → serial  {full}")
-        sio.emit("neck_ack", {"command":full})
-    except Exception as e:
-        print("[agent] serial error:", e)
+@sio.on("peer-message")
+def _peer_msg(data):
+    # accept generic peer messages too; route "neck" commands to serial
+    msg = str(data.get("message", "")).strip()
+    if msg:
+        ser.write((msg + "\n").encode())
+        print(f"[agent] → serial  {msg}")
+        sio.emit("neck_ack", {"command": msg})
 
-@sio.on("peer-message")          # relayed from UI
-def _msg(d): handle_cmd(str(d.get("message","")).strip())
+def _connect_ws():
+    while True:
+        try:
+            sio.connect(server_url, auth={"token": jwt_token})
+            break
+        except Exception as e:
+            print(f"[agent] WS connect error: {e}")
+            time.sleep(3)
+_connect_ws()
 
-@sio.on("neck_command")          # optional direct event
-def _cmd(d): handle_cmd(str(d.get("command","")).strip())
+# ───────── camera processing helpers ─────────
+TARGET_W, TARGET_H = 640, 360
 
-# connect with JWT
-while True:
-    try:
-        sio.connect(SERVER, auth={"token":token}); break
-    except Exception as e:
-        print("[agent] WS connect error:", e); time.sleep(3)
+def resize_center_crop_to(img: Image.Image, tw: int, th: int) -> Image.Image:
+    # scale so both dims >= target, then center crop
+    w, h = img.width, img.height
+    scale = max(tw / w, th / h)
+    nw, nh = int(round(w * scale)), int(round(h * scale))
+    img = img.resize((nw, nh), resample=Image.LANCZOS)
+    left = (nw - tw) // 2
+    top  = (nh - th) // 2
+    return img.crop((left, top, left + tw, top + th))
 
-print("[agent] bridge live – Ctrl-C to quit")
+def encode_jpeg(img: Image.Image, q: int = 72) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=q, optimize=False)
+    return buf.getvalue()
+
+def encode_png(gray8: np.ndarray) -> bytes:
+    img = Image.fromarray(gray8, mode="L")
+    buf = io.BytesIO()
+    # PNG level 3 for speed
+    img.save(buf, format="PNG", optimize=False, compress_level=3)
+    return buf.getvalue()
+
+def depth_to_8bit(arr: np.ndarray) -> np.ndarray:
+    # robust 2-98 percentile stretch to 0..255
+    a = arr.astype(np.float32, copy=False)
+    lo, hi = np.percentile(a, (2.0, 98.0))
+    if hi <= lo: hi = lo + 1.0
+    a = np.clip((a - lo) / (hi - lo), 0.0, 1.0)
+    return (a * 255.0 + 0.5).astype(np.uint8)
+
+# ───────── camera loop (background) ─────────
+_cam_stop = threading.Event()
+
+def camera_loop():
+    sess = requests.Session()
+    sess.headers.update({"Connection": "keep-alive"})
+    last_warn = 0.0
+    while not _cam_stop.is_set():
+        t0 = time.perf_counter()
+        try:
+            # fetch frames
+            rc = sess.get(color_url, timeout=1.0)
+            rd = sess.get(depth_url, timeout=1.0)
+            if rc.status_code != 200 or rd.status_code != 200:
+                raise RuntimeError(f"HTTP {rc.status_code}/{rd.status_code}")
+
+            # COLOR → resize + crop → JPEG
+            col_img = Image.open(io.BytesIO(rc.content)).convert("RGB")
+            col_img = resize_center_crop_to(col_img, TARGET_W, TARGET_H)
+            col_jpg = encode_jpeg(col_img, q=72)
+
+            # DEPTH → load → 8-bit → PNG
+            # Accept common formats: 8/16-bit PNG, JPEG heatmap, etc.
+            try:
+                dimg = Image.open(io.BytesIO(rd.content))
+                if dimg.mode in ("I;16", "I;16B", "I;16L"):
+                    arr = np.array(dimg, dtype=np.uint16)
+                    gray8 = depth_to_8bit(arr)
+                else:
+                    # If already 8-bit (L or RGB heatmap), convert to L
+                    dimg = dimg.convert("L")
+                    gray8 = np.array(dimg, dtype=np.uint8)
+                # ensure size is 640x360 (resize if needed)
+                if dimg.size != (TARGET_W, TARGET_H):
+                    dimg = Image.fromarray(gray8, mode="L").resize((TARGET_W, TARGET_H), Image.NEAREST)
+                    gray8 = np.array(dimg, dtype=np.uint8)
+                depth_png = encode_png(gray8)
+            except Exception:
+                # fallback: send as-is JPEG (fast path)
+                depth_png = rd.content
+
+            # emit as binary buffers (Socket.IO handles binary natively)
+            sio.emit("frame-color", col_jpg)
+            sio.emit("frame-depth", depth_png)
+
+        except Exception as e:
+            now = time.time()
+            if now - last_warn > 2.0:
+                print(f"[agent] camera loop warning: {e}")
+                last_warn = now
+
+        # aim ~10–15 fps (adjust as needed)
+        dt = time.perf_counter() - t0
+        time.sleep(max(0.0, 0.07 - dt))
+
+cam_thr = threading.Thread(target=camera_loop, daemon=True)
+cam_thr.start()
+
+print("[agent] bridge + camera streaming live – Ctrl-C to quit")
+
 try:
-    while True: time.sleep(1)
+    while True:
+        time.sleep(1)
 except KeyboardInterrupt:
     pass
 finally:
+    _cam_stop.set()
+    try: cam_thr.join(timeout=1.0)
+    except: ...
     try: ser.close()
     except: ...
     try: sio.disconnect()

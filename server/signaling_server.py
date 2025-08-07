@@ -226,6 +226,14 @@ def _connect(auth):
                   [{"id": pid, **info} for pid, info in clients.items() if pid != sid],
                   to=sid)
 
+@socketio.on("frame-color")
+def _relay_color(data):
+    # `data` is bytes; re-emit to all except sender
+    socketio.emit("frame-color", data, skip_sid=request.sid)
+
+@socketio.on("frame-depth")
+def _relay_depth(data):
+    socketio.emit("frame-depth", data, skip_sid=request.sid)
 
 @socketio.on("disconnect")
 def _disconnect():

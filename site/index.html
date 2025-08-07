@@ -1,78 +1,123 @@
 <!DOCTYPE html>
 <html lang="en">
-<meta charset="utf-8">
-<title>Neck-Phone Controller (WS-only)</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Neck-Phone Controller</title>
+
 <style>
-:root { color-scheme: dark; }
-*{box-sizing:border-box}
-body{margin:0;background:#111;color:#fafafa;font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
-#status{position:fixed;left:.5rem;top:.25rem;font-size:2rem;line-height:1}
-main{text-align:center;display:flex;flex-direction:column;gap:.5rem}
-#orient,#cmd{font-family:ui-monospace,Menlo,Consolas,"Roboto Mono",monospace;white-space:pre}
-#orient{font-size:1.1rem;opacity:.9}
-#cmd{font-size:1.15rem}
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; background: #111; color: #fafafa;
+    font: 16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10; background: #111; border-bottom: 1px solid #333;
+    display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: .5rem;
+    padding: .5rem .75rem;
+  }
+  #status { font-size: 1.6rem; }
+  .actions { display: flex; gap: .5rem; }
+  button, input, select {
+    background: #181818; color: #fff; border: 1px solid #444; border-radius: .35rem;
+    padding: .45rem .7rem; font: inherit;
+  }
+  button:hover { background: #222; }
+  main { max-width: 1100px; margin: 0 auto; padding: .75rem; display: grid; gap: .75rem; }
+  .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Roboto Mono", monospace; }
+  .panel {
+    border: 1px solid #333; border-radius: .5rem; padding: .75rem; background: #121212;
+  }
+  .images { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+  .images img { width: 100%; height: auto; display: block; background: #0a0a0a; border: 1px solid #222; }
 
-.controls{position:fixed;right:.5rem;top:.5rem;display:flex;gap:.5rem;flex-wrap:wrap;justify-content:flex-end}
-.controls button{padding:.45rem .7rem;border-radius:.4rem;background:#1f2937;color:#fafafa;border:1px solid #2d3748;cursor:pointer}
-.controls button:hover{background:#2a3443}
-.controls button:disabled{opacity:.5;cursor:not-allowed}
-
-#configDlg{position:fixed;inset:0;background:#0009;display:flex;align-items:center;justify-content:center}
-#configDlg[hidden]{display:none}
-#configDlg form{width:min(92vw,30rem);background:#1a1a1a;border:1px solid #333;border-radius:.6rem;padding:1.25rem;display:grid;gap:.85rem}
-#configDlg h2{margin:.2rem 0 .6rem;font-weight:600}
-label{display:grid;gap:.35rem;text-align:left}
-input{padding:.55rem .6rem;border-radius:.35rem;border:1px solid #444;background:#111;color:#fafafa;outline:none}
-input:focus{border-color:#0ea5e9}
-.rangeRow{display:grid;grid-template-columns:1fr auto;gap:.5rem;align-items:center}
-small.muted{opacity:.7}
-button.primary{background:#0ea5e9;border:0;color:#fff;padding:.6rem .9rem;border-radius:.4rem;cursor:pointer}
-button.primary:hover{filter:brightness(1.05)}
+  /* Settings modal */
+  #configDlg[hidden] { display: none; }
+  #configDlg {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: grid; place-items: center;
+  }
+  #configDlg .card {
+    width: min(92vw, 540px); background: #171717; border: 1px solid #333; border-radius: .6rem;
+    padding: 1rem; display: grid; gap: .75rem;
+  }
+  .grid { display: grid; gap: .5rem; }
+  label small { display:block; opacity:.8; }
+  .rangeRow {
+    display:grid; gap:.5rem; grid-template-columns: 1fr minmax(4.5rem, 6rem);
+    align-items:center;
+  }
+  .muted { opacity: .7; }
 </style>
 
-<!-- Socket.IO client (no HTTP fetch used for auth) -->
+<!-- Socket.IO client (browser build) -->
 <script src="https://unpkg.com/socket.io-client@4.7.5/dist/socket.io.min.js"></script>
 
 <body>
-  <div id="status" aria-label="connection status">🔴</div>
-
-  <div class="controls" aria-label="actions">
-    <button id="btnHome">Home</button>
-    <button id="btnPerms">Enable Sensors</button>
-    <button id="btnCenter">Center</button>
-    <button id="btnSettings">Settings</button>
-  </div>
+  <header>
+    <div id="status" title="Connection status">🔴</div>
+    <div class="row mono">
+      <div id="orient" class="panel">Yaw 0° &nbsp; Pitch 0° &nbsp; Roll 0°</div>
+      <div id="cmd" class="panel">X0,Y0,Z0,H0,S1,A1,R0,P0</div>
+    </div>
+    <div class="actions">
+      <button id="btnPerms" title="Request motion/orientation permission (iOS)">Enable Sensors</button>
+      <button id="btnCenter" title="Center orientation (set baseline)">Center</button>
+      <button id="btnHome" title="Send HOME and pause streaming 5s">HOME</button>
+      <button id="btnSettings" title="Open settings">Settings</button>
+    </div>
+  </header>
 
   <main>
-    <div id="orient">Yaw 0°  Pitch 0°  Roll 0°</div>
-    <div id="cmd">X0,Y0,Z0,H0,S1,A1,R0,P0</div>
+    <section class="panel">
+      <div class="row">
+        <div class="muted">Live Feeds</div>
+      </div>
+      <div class="images">
+        <div>
+          <div class="muted mono">Color</div>
+          <img id="imgColor" alt="color stream">
+        </div>
+        <div>
+          <div class="muted mono">Depth</div>
+          <img id="imgDepth" alt="depth stream">
+        </div>
+      </div>
+    </section>
   </main>
 
-  <!-- first-run / settings dialog -->
+  <!-- Settings / first-run -->
   <div id="configDlg">
-    <form id="cfgForm">
-      <h2>Connect to neck</h2>
-      <label>Signaling server URL
-        <input id="srv" placeholder="https://neck-signal.loca.lt" required>
-      </label>
-      <label>Shared password
-        <input id="pw" placeholder="shared secret" required>
-      </label>
+    <div class="card">
+      <h2 class="mono" style="margin:0;">Connect to signaling</h2>
+      <form id="cfgForm" class="grid">
+        <label class="grid">
+          <span>Signaling Server URL</span>
+          <input id="srv" placeholder="https://neck-signal.example.tld" required>
+        </label>
+        <label class="grid">
+          <span>Shared Password</span>
+          <input id="pw" placeholder="••••••••" required>
+        </label>
 
-      <label>Update frequency
-        <div class="rangeRow">
-          <input type="range" id="rateSlider" min="10" max="100" step="1">
-          <div>
-            <input id="rateBox" type="number" min="0.01" max="0.10" step="0.005" style="width:5.5rem"> s
-            <small class="muted"> (10–100 ms)</small>
+        <div class="grid">
+          <label>Stream Update Interval</label>
+          <div class="rangeRow">
+            <input id="rateSlider" type="range" min="10" max="100" step="1">
+            <div class="row">
+              <input id="rateBox" type="number" min="0.01" max="0.10" step="0.01" class="mono" style="width:5.5rem;">
+              <span class="muted">sec</span>
+            </div>
           </div>
+          <small class="muted">Range 0.01–0.10 seconds (10–100 ms)</small>
         </div>
-      </label>
 
-      <small class="muted">Settings are saved in your browser.</small>
-      <button class="primary">Save &amp; connect</button>
-    </form>
+        <div class="row" style="justify-content:flex-end; gap:.5rem;">
+          <button type="button" onclick="document.getElementById('configDlg').hidden=true">Close</button>
+          <button type="submit" style="background:#0a84ff; border-color:#0a84ff;">Save &amp; Connect</button>
+        </div>
+      </form>
+    </div>
   </div>
 
 <script>
@@ -95,11 +140,15 @@ const btnCenter= document.getElementById('btnCenter');
 const btnSettings = document.getElementById('btnSettings');
 const btnHome  = document.getElementById('btnHome');
 
+const imgColor = document.getElementById('imgColor');
+const imgDepth = document.getElementById('imgDepth');
+let urlColor = null, urlDepth = null;
+
 const SIO_PATH = "/socket.io";  // change only if server uses custom path
 
 let serverURL   = "";
 let sharedPW    = "";
-let jwtToken    = st.getItem('neck_jwt') || ""; // optional cached JWT (if your server supports)
+let jwtToken    = st.getItem('neck_jwt') || ""; // optional cached JWT (if ever used)
 let socket      = null;
 
 // orientation baseline + live values (deg)
@@ -268,10 +317,39 @@ function scheduleTick() {
 scheduleTick(); // start loop immediately; will no-op until connected
 
 ////////////////////////////////////////////////////////////////////////////////
-// 6) networking: WS-only auth strategy
-//    - If we have a cached JWT, try token-first
-//    - Otherwise (or on failure), connect with {uuid,password} directly
-//      (requires server to accept password in WS auth; JWT path unchanged)
+// 6) networking helpers: bind per-socket handlers
+////////////////////////////////////////////////////////////////////////////////
+function wireCommonHandlers(s) {
+  s.on('connect',      () => setStatus('🟢'));
+  s.on('disconnect',   () => setStatus('🔴'));
+  s.on('connect_error',() => setStatus('🔴'));
+}
+
+function updateImg(imgEl, oldUrlRefName, payload, mime) {
+  // payload may be ArrayBuffer/Uint8Array/Blob
+  const blob = payload instanceof Blob ? payload : new Blob([payload], { type: mime });
+  const url = URL.createObjectURL(blob);
+  imgEl.src = url;
+  if (window[oldUrlRefName]) URL.revokeObjectURL(window[oldUrlRefName]);
+  window[oldUrlRefName] = url;
+}
+
+function wireFrameHandlers(s) {
+  // clean previous handlers to avoid dupes on reconnect
+  s.off('frame-color'); s.off('frame-depth');
+
+  s.on('frame-color', (payload) => {
+    updateImg(imgColor, 'urlColor', payload, 'image/jpeg');
+  });
+  s.on('frame-depth', (payload) => {
+    updateImg(imgDepth, 'urlDepth', payload, 'image/png');
+  });
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// 7) networking: WS-only auth strategy
+//    - Try JWT if present
+//    - Else use {uuid,password} directly via WS auth
 ////////////////////////////////////////////////////////////////////////////////
 function connectWS_withToken() {
   return new Promise((resolve,reject)=>{
@@ -281,9 +359,11 @@ function connectWS_withToken() {
       transports: ['websocket']
     });
     let settled = false;
+    wireCommonHandlers(s);
+    wireFrameHandlers(s);
+
     s.on('connect', () => { socket = s; setStatus('🟢'); settled = true; resolve('token'); });
-    s.on('disconnect',   () => setStatus('🔴'));
-    s.on('connect_error',(err) => { if (!settled) { s.close(); reject(err); } setStatus('🔴'); });
+    s.on('connect_error',(err) => { if (!settled) { s.close(); reject(err); } });
   });
 }
 function connectWS_withPassword() {
@@ -295,12 +375,15 @@ function connectWS_withPassword() {
       transports: ['websocket']
     });
     let settled = false;
+    wireCommonHandlers(s);
+    wireFrameHandlers(s);
+
     s.on('connect', () => { socket = s; setStatus('🟢'); settled = true; resolve('password'); });
-    s.on('disconnect',   () => setStatus('🔴'));
-    s.on('connect_error',(err) => { if (!settled) { s.close(); reject(err); } setStatus('🔴'); });
+    s.on('connect_error',(err) => { if (!settled) { s.close(); reject(err); } });
   });
 }
 
+////////////////////////////////////////////////////////////////////////////////
 async function boot() {
   serverURL = (st.getItem('neck_server') || "").trim().replace(/\/+$/, '');
   sharedPW  = (st.getItem('neck_pw')     || "").trim();
