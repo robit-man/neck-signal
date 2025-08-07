@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Neck-Phone Controller (WS-only)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root { color-scheme: dark; }
+*{box-sizing:border-box}
+body{margin:0;background:#111;color:#fafafa;font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
+#status{position:fixed;left:.5rem;top:.25rem;font-size:2rem;line-height:1}
+main{text-align:center;display:flex;flex-direction:column;gap:.5rem}
+#orient,#cmd{font-family:ui-monospace,Menlo,Consolas,"Roboto Mono",monospace;white-space:pre}
+#orient{font-size:1.1rem;opacity:.9}
+#cmd{font-size:1.15rem}
+
+.controls{position:fixed;right:.5rem;top:.5rem;display:flex;gap:.5rem;flex-wrap:wrap;justify-content:flex-end}
+.controls button{padding:.45rem .7rem;border-radius:.4rem;background:#1f2937;color:#fafafa;border:1px solid #2d3748;cursor:pointer}
+.controls button:hover{background:#2a3443}
+.controls button:disabled{opacity:.5;cursor:not-allowed}
+
+#configDlg{position:fixed;inset:0;background:#0009;display:flex;align-items:center;justify-content:center}
+#configDlg[hidden]{display:none}
+#configDlg form{width:min(90vw,28rem);background:#1a1a1a;border:1px solid #333;border-radius:.6rem;padding:1.25rem;display:grid;gap:.85rem}
+#configDlg h2{margin:.2rem 0 .6rem;font-weight:600}
+label{display:grid;gap:.35rem;text-align:left}
+input{padding:.55rem .6rem;border-radius:.35rem;border:1px solid #444;background:#111;color:#fafafa;outline:none}
+input:focus{border-color:#0ea5e9}
+button.primary{background:#0ea5e9;border:0;color:#fff;padding:.6rem .9rem;border-radius:.4rem;cursor:pointer}
+button.primary:hover{filter:brightness(1.05)}
+small.muted{opacity:.7}
+</style>
+
+<!-- Socket.IO client (no HTTP fetch used) -->
+<script src="https://unpkg.com/socket.io-client@4.7.5/dist/socket.io.min.js"></script>
+
+<body>
+  <div id="status" aria-label="connection status">🔴</div>
+
+  <div class="controls" aria-label="actions">
+    <button id="btnPerms">Enable Sensors</button>
+    <button id="btnCenter">Center</button>
+    <button id="btnSettings">Settings</button>
+  </div>
+
+  <main>
+    <div id="orient">Yaw 0°  Pitch 0°  Roll 0°</div>
+    <div id="cmd">X0,Y0,Z0,H0,S1,A1,R0,P0</div>
+  </main>
+
+  <!-- first-run / settings dialog -->
+  <div id="configDlg">
+    <form id="cfgForm">
+      <h2>Connect to neck</h2>
+      <label>Signaling server URL
+        <input id="srv" placeholder="https://neck-signal.loca.lt" required>
+      </label>
+      <label>Shared password
+        <input id="pw" placeholder="shared secret" required>
+      </label>
+      <small class="muted">Settings are saved in your browser.</small>
+      <button class="primary">Save &amp; connect</button>
+    </form>
+  </div>
+
+<script>
+////////////////////////////////////////////////////////////////////////////////
+// 0) Utility & globals
+////////////////////////////////////////////////////////////////////////////////
+const st = localStorage;
+const statusEl = document.getElementById('status');
+const orientEl = document.getElementById('orient');
+const cmdEl    = document.getElementById('cmd');
+
+const cfgDlg   = document.getElementById('configDlg');
+const srvInp   = document.getElementById('srv');
+const pwInp    = document.getElementById('pw');
+const btnPerms = document.getElementById('btnPerms');
+const btnCenter= document.getElementById('btnCenter');
+const btnSettings = document.getElementById('btnSettings');
+
+const SIO_PATH = "/socket.io";  // change only if server uses custom path
+
+let serverURL   = "";
+let sharedPW    = "";
+let jwtToken    = st.getItem('neck_jwt') || ""; // optional cache (if server also supports JWT)
+let socket      = null;
+
+// orientation baseline + live values (deg)
+let baseYaw=null, basePitch=null, baseRoll=null;
+let yaw=0, pitch=0, roll=0;
+
+// acceleration & transient translations
+let accel = {x:0,y:0,z:0};
+let trans = {Y:0,Z:0,H:0};
+
+// tuning (feel free to tweak)
+const GAIN_YAW   = 8;   // deg → units
+const GAIN_PITCH = 8;
+const GAIN_ROLL  = 8;
+
+const DECAY = 0.90;     // exponential decay for transients
+const INTERVAL_MS = 100;
+
+// constraints
+const clamp=(v,min,max)=>Math.min(max,Math.max(min,v));
+
+// status LED
+const setStatus=(emoji)=>{ statusEl.textContent = emoji; };
+
+// normalize angle to [-180,180]
+const wrap180 = a => ((a+540)%360)-180;
+
+// get relative orientation -> target ranges
+function getRelativeAngles() {
+  if (baseYaw==null || basePitch==null || baseRoll==null) return {X:0,P:0,R:0};
+  const dYaw   = wrap180(yaw   - baseYaw);
+  const dPitch = wrap180(pitch - basePitch);
+  const dRoll  = wrap180(roll  - baseRoll);
+
+  const X = clamp(-dYaw   * GAIN_YAW  , -400, 400); // negative look right, positive left
+  const P = clamp( dPitch * GAIN_PITCH, -400, 400); // + up, - down
+  const R = clamp( dRoll  * GAIN_ROLL , -400, 400); // - right tilt, + left tilt
+  return {X,P,R};
+}
+
+function decay(v){ return Math.abs(v) < 1 ? 0 : v*DECAY; }
+
+////////////////////////////////////////////////////////////////////////////////
+// 1) iOS / browser sensor permissions
+////////////////////////////////////////////////////////////////////////////////
+async function requestSensorPermissions() {
+  // iOS 13+ requires explicit permission *and* a user gesture
+  try {
+    let p1 = (window.DeviceMotionEvent && typeof DeviceMotionEvent.requestPermission === 'function')
+      ? await DeviceMotionEvent.requestPermission() : 'granted';
+    let p2 = (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function')
+      ? await DeviceOrientationEvent.requestPermission() : 'granted';
+    if (p1 !== 'granted' || p2 !== 'granted') {
+      alert('Motion/orientation permissions were not granted. On iOS, use Safari over HTTPS.');
+      return false;
+    }
+    return true;
+  } catch (e) {
+    // Non-iOS or already allowed
+    return true;
+  }
+}
+
+btnPerms.addEventListener('click', async () => {
+  const ok = await requestSensorPermissions();
+  if (ok) btnPerms.disabled = true;
+});
+
+// auto-disable button on non-iOS
+if (!/iphone|ipad|ipod/i.test(navigator.userAgent)) {
+  btnPerms.disabled = true;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// 2) settings modal (persist to localStorage)
+////////////////////////////////////////////////////////////////////////////////
+srvInp.value = st.getItem('neck_server') || "";
+pwInp.value  = st.getItem('neck_pw')     || "";
+
+document.getElementById('cfgForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  st.setItem('neck_server', srvInp.value.trim());
+  st.setItem('neck_pw',     pwInp.value.trim());
+  cfgDlg.hidden = true;
+  await boot();  // connect after saving
+});
+
+btnSettings.addEventListener('click', () => {
+  cfgDlg.hidden = false;
+});
+
+if (srvInp.value && pwInp.value) {
+  cfgDlg.hidden = true;
+  boot(); // autoconnect on revisit
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// 3) live sensors
+////////////////////////////////////////////////////////////////////////////////
+window.addEventListener('deviceorientation', e => {
+  if (e.alpha != null) {
+    yaw   = e.alpha;   // 0..360
+    pitch = e.beta;    // -180..180
+    roll  = e.gamma;   // -90..90
+    orientEl.textContent = `Yaw ${yaw.toFixed(0)}°  Pitch ${pitch.toFixed(0)}°  Roll ${roll.toFixed(0)}°`;
+  }
+}, true);
+
+window.addEventListener('devicemotion', e => {
+  let a = e.acceleration && (e.acceleration.x!=null) ? e.acceleration : e.accelerationIncludingGravity;
+  if (a) accel = { x: a.x || 0, y: a.y || 0, z: a.z || 0 };
+}, true);
+
+btnCenter.addEventListener('click', () => {
+  baseYaw = yaw; basePitch = pitch; baseRoll = roll;
+});
+
+////////////////////////////////////////////////////////////////////////////////
+// 4) command synthesis & streaming (every 100ms)
+////////////////////////////////////////////////////////////////////////////////
+function tick() {
+  if (!socket || socket.disconnected) return;
+
+  // map motion impulses → transient translations, then decay toward 0
+  //   forward/back  : accel.y -> Z (− forward, + backward)
+  //   up/down       : accel.z -> H (0..50)
+  //   left/right    : accel.x -> Y (− left, + right)
+  trans.Z = clamp(decay(trans.Z + (-accel.y*10)), -400, 400);
+  trans.H = clamp(decay(trans.H + ( accel.z* 2)),   0,  50);
+  trans.Y = clamp(decay(trans.Y + ( accel.x*10)), -400, 400);
+
+  const {X,P,R} = getRelativeAngles();
+  const cmd = `X${X.toFixed(0)},Y${trans.Y.toFixed(0)},Z${trans.Z.toFixed(0)},` +
+              `H${trans.H.toFixed(0)},S1,A1,R${R.toFixed(0)},P${P.toFixed(0)}`;
+  cmdEl.textContent = cmd;
+
+  socket.emit('broadcast-message', { message: cmd });
+}
+
+setInterval(tick, 100);
+
+////////////////////////////////////////////////////////////////////////////////
+// 5) networking: WS-only auth strategy
+//    - If we have a cached JWT, try token-first
+//    - Otherwise (or on failure), connect with {uuid,password} directly
+//      (requires the tiny server patch below so the server accepts pw-based WS)
+////////////////////////////////////////////////////////////////////////////////
+function connectWS_withToken() {
+  return new Promise((resolve,reject)=>{
+    const s = io(serverURL, {
+      path: SIO_PATH,
+      auth: { token: jwtToken },       // JWT string
+      transports: ['websocket']
+    });
+    let settled = false;
+    s.on('connect', () => {
+      socket = s; setStatus('🟢'); settled = true; resolve('token');
+    });
+    s.on('disconnect', () => { setStatus('🔴'); });
+    s.on('connect_error', (err) => {
+      if (!settled) { s.close(); reject(err); }
+      setStatus('🔴');
+    });
+  });
+}
+
+function connectWS_withPassword() {
+  return new Promise((resolve,reject)=>{
+    const uuid = 'phone-' + Date.now().toString(36);
+    const s = io(serverURL, {
+      path: SIO_PATH,
+      auth: { uuid, password: sharedPW },   // WS-only auth (server verifies)
+      transports: ['websocket']
+    });
+    let settled = false;
+    s.on('connect', () => { socket = s; setStatus('🟢'); settled = true; resolve('password'); });
+    s.on('disconnect', () => { setStatus('🔴'); });
+    s.on('connect_error', (err) => {
+      if (!settled) { s.close(); reject(err); }
+      setStatus('🔴');
+    });
+  });
+}
+
+async function boot() {
+  serverURL = (st.getItem('neck_server') || "").trim().replace(/\/+$/, '');
+  sharedPW  = (st.getItem('neck_pw')     || "").trim();
+  if (!serverURL || !sharedPW) {
+    cfgDlg.hidden = false;
+    return;
+  }
+
+  setStatus('🟡');
+
+  // iOS sensors require HTTPS
+  if (!window.isSecureContext && /iphone|ipad|ipod/i.test(navigator.userAgent)) {
+    alert("iOS sensors require HTTPS. Open this page via https.");
+  }
+
+  // Try token connect if we have one cached; otherwise go straight to password WS.
+  try {
+    if (jwtToken) {
+      await connectWS_withToken();
+    } else {
+      await connectWS_withPassword();
+    }
+  } catch (e) {
+    // Fallback: try password WS if token path fails
+    try { await connectWS_withPassword(); }
+    catch (ee) { console.error('WS connect failed:', ee); setStatus('🔴'); }
+  }
+
+  // auto-calibrate once after 1s if not already done
+  setTimeout(() => { if (baseYaw==null) btnCenter.click(); }, 1000);
+}
+</script>
+</body>
+</html>
