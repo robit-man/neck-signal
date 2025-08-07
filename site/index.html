@@ -30,6 +30,7 @@
   }
   .images { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
   .images img { width: 100%; height: auto; display: block; background: #0a0a0a; border: 1px solid #222; }
+  .muted { opacity: .7; }
 
   /* Settings modal */
   #configDlg[hidden] { display: none; }
@@ -38,8 +39,8 @@
     display: grid; place-items: center;
   }
   #configDlg .card {
-    width: min(92vw, 540px); background: #171717; border: 1px solid #333; border-radius: .6rem;
-    padding: 1rem; display: grid; gap: .75rem;
+    width: min(92vw, 560px); background: #171717; border: 1px solid #333; border-radius: .6rem;
+    padding: 1rem; display: grid; gap: .85rem;
   }
   .grid { display: grid; gap: .5rem; }
   label small { display:block; opacity:.8; }
@@ -47,19 +48,16 @@
     display:grid; gap:.5rem; grid-template-columns: 1fr minmax(4.5rem, 6rem);
     align-items:center;
   }
-  .muted { opacity: .7; }
+  .flips { display:grid; grid-template-columns: repeat(6, auto); gap:.5rem .75rem; align-items:center; }
 </style>
 
-<!-- Socket.IO client (browser build) -->
+<!-- Socket.IO client (browser bundle) -->
 <script src="https://unpkg.com/socket.io-client@4.7.5/dist/socket.io.min.js"></script>
 
 <body>
   <header>
     <div id="status" title="Connection status">🔴</div>
-    <div class="row mono">
-      <div id="orient" class="panel">Yaw 0° &nbsp; Pitch 0° &nbsp; Roll 0°</div>
-      <div id="cmd" class="panel">X0,Y0,Z0,H0,S1,A1,R0,P0</div>
-    </div>
+
     <div class="actions">
       <button id="btnPerms" title="Request motion/orientation permission (iOS)">Enable Sensors</button>
       <button id="btnCenter" title="Center orientation (set baseline)">Center</button>
@@ -72,6 +70,7 @@
     <section class="panel">
       <div class="row">
         <div class="muted">Live Feeds</div>
+        <div class="muted mono" id="whichRobot" style="margin-left:auto;">robot: —</div>
       </div>
       <div class="images">
         <div>
@@ -82,6 +81,10 @@
           <div class="muted mono">Depth</div>
           <img id="imgDepth" alt="depth stream">
         </div>
+      </div>
+      <div class="row mono">
+        <div id="orient" class="panel">Yaw 0° &nbsp; Pitch 0° &nbsp; Roll 0°</div>
+        <div id="cmd" class="panel">X0,Y0,Z0,H0,S1,A1,R0,P0</div>
       </div>
     </section>
   </main>
@@ -112,6 +115,21 @@
           <small class="muted">Range 0.01–0.10 seconds (10–100 ms)</small>
         </div>
 
+        <div class="grid">
+          <label>Axis Sign Flips</label>
+          <div class="flips">
+            <label class="row"><input type="checkbox" id="flipX"> X</label>
+            <label class="row"><input type="checkbox" id="flipY"> Y</label>
+            <label class="row"><input type="checkbox" id="flipZ"> Z</label>
+            <label class="row"><input type="checkbox" id="flipH"> H</label>
+            <label class="row"><input type="checkbox" id="flipP"> P</label>
+            <label class="row"><input type="checkbox" id="flipR"> R</label>
+          </div>
+          <small class="muted mono">
+            X,Y,Z,P,R flip by multiplying with −1. H flip mirrors as (50 − H) to preserve 0..50 range.
+          </small>
+        </div>
+
         <div class="row" style="justify-content:flex-end; gap:.5rem;">
           <button type="button" onclick="document.getElementById('configDlg').hidden=true">Close</button>
           <button type="submit" style="background:#0a84ff; border-color:#0a84ff;">Save &amp; Connect</button>
@@ -125,9 +143,10 @@
 // 0) Utility & globals
 ////////////////////////////////////////////////////////////////////////////////
 const st = localStorage;
-const statusEl = document.getElementById('status');
-const orientEl = document.getElementById('orient');
-const cmdEl    = document.getElementById('cmd');
+const statusEl   = document.getElementById('status');
+const orientEl   = document.getElementById('orient');
+const cmdEl      = document.getElementById('cmd');
+const whichRobot = document.getElementById('whichRobot');
 
 const cfgDlg   = document.getElementById('configDlg');
 const srvInp   = document.getElementById('srv');
@@ -135,21 +154,36 @@ const pwInp    = document.getElementById('pw');
 const rateSlider = document.getElementById('rateSlider');
 const rateBox    = document.getElementById('rateBox');
 
-const btnPerms = document.getElementById('btnPerms');
-const btnCenter= document.getElementById('btnCenter');
-const btnSettings = document.getElementById('btnSettings');
-const btnHome  = document.getElementById('btnHome');
+const btnPerms   = document.getElementById('btnPerms');
+const btnCenter  = document.getElementById('btnCenter');
+const btnSettings= document.getElementById('btnSettings');
+const btnHome    = document.getElementById('btnHome');
 
 const imgColor = document.getElementById('imgColor');
 const imgDepth = document.getElementById('imgDepth');
 let urlColor = null, urlDepth = null;
 
-const SIO_PATH = "/socket.io";  // change only if server uses custom path
+const flipBoxes = {
+  X: document.getElementById('flipX'),
+  Y: document.getElementById('flipY'),
+  Z: document.getElementById('flipZ'),
+  H: document.getElementById('flipH'),
+  P: document.getElementById('flipP'),
+  R: document.getElementById('flipR'),
+};
+
+const SIO_PATH = "/socket.io";  // server default path
 
 let serverURL   = "";
 let sharedPW    = "";
-let jwtToken    = st.getItem('neck_jwt') || ""; // optional cached JWT (if ever used)
+let jwtToken    = st.getItem('neck_jwt') || ""; // optional cached JWT
 let socket      = null;
+
+// identity / presence
+let myUuid = st.getItem('neck_my_uuid') || null;
+let targetUuid = st.getItem('neck_target_uuid') || null;
+const sidToUuid = new Map();
+let subscribedUuid = null;
 
 // orientation baseline + live values (deg)
 let baseYaw=null, basePitch=null, baseRoll=null;
@@ -164,6 +198,10 @@ let sendIntervalMs = Number(st.getItem('neck_rate_ms') || 100); // default 100ms
 let intervalTimer = null;
 let pauseUntil = 0; // ms timestamp; while in the future, streaming is paused
 
+// sign flip map (multipliers)
+const flipsDefault = { X:1, Y:1, Z:1, H:1, P:1, R:1 };
+let flips = loadFlips();
+
 // tuning
 const GAIN_YAW   = 8;   // deg → units
 const GAIN_PITCH = 8;
@@ -171,23 +209,26 @@ const GAIN_ROLL  = 8;
 
 const DECAY = 0.90;     // exponential decay for transients
 
-// constraints/helpers
-const clamp=(v,min,max)=>Math.min(max,Math.max(min,v));
-const setStatus=(emoji)=>{ statusEl.textContent = emoji; };
-const wrap180 = a => ((a+540)%360)-180;
+// helpers
+const clamp   = (v,min,max)=>Math.min(max,Math.max(min,v));
+const setStatus = (emoji)=>{ statusEl.textContent = emoji; };
+const wrap180 = a => ((a+540)%360)-180;          // normalize to (-180,180]
+const now = ()=>Date.now();
 
-function getRelativeAngles() {
-  if (baseYaw==null || basePitch==null || baseRoll==null) return {X:0,P:0,R:0};
-  const dYaw   = wrap180(yaw   - baseYaw);
-  const dPitch = wrap180(pitch - basePitch);
-  const dRoll  = wrap180(roll  - baseRoll);
-  const X = clamp(-dYaw   * GAIN_YAW  , -400, 400); // negative look right, positive left
-  const P = clamp( dPitch * GAIN_PITCH, -400, 400); // + up, - down
-  const R = clamp( dRoll  * GAIN_ROLL , -400, 400); // - right tilt, + left tilt
-  return {X,P,R};
+function loadFlips() {
+  try { return Object.assign({}, flipsDefault, JSON.parse(st.getItem('neck_flips') || '{}')); }
+  catch { return { ...flipsDefault }; }
 }
-function decay(v){ return Math.abs(v) < 1 ? 0 : v*DECAY; }
-function now(){ return Date.now(); }
+function saveFlips() { st.setItem('neck_flips', JSON.stringify(flips)); }
+function populateFlipUI(){
+  for (const k of Object.keys(flipBoxes)) flipBoxes[k].checked = flips[k] === -1;
+}
+for (const k of Object.keys(flipBoxes)) {
+  flipBoxes[k].addEventListener('change', () => {
+    flips[k] = flipBoxes[k].checked ? -1 : 1;
+    saveFlips();
+  });
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // 1) iOS / browser sensor permissions
@@ -203,9 +244,7 @@ async function requestSensorPermissions() {
       return false;
     }
     return true;
-  } catch {
-    return true;
-  }
+  } catch { return true; }
 }
 btnPerms.addEventListener('click', async () => {
   const ok = await requestSensorPermissions();
@@ -220,11 +259,14 @@ srvInp.value = st.getItem('neck_server') || "";
 pwInp.value  = st.getItem('neck_pw')     || "";
 rateSlider.value = String(sendIntervalMs);
 rateBox.value    = (sendIntervalMs/1000).toFixed(2);
+populateFlipUI();
 
 document.getElementById('cfgForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   st.setItem('neck_server', srvInp.value.trim());
   st.setItem('neck_pw',     pwInp.value.trim());
+  st.setItem('neck_rate_ms', String(sendIntervalMs));
+  saveFlips();
   cfgDlg.hidden = true;
   await boot();  // connect after saving
 });
@@ -253,13 +295,14 @@ if (srvInp.value && pwInp.value) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// 3) live sensors
+// 3) live sensors (Yaw(α)→X, Pitch(β)→P, Roll(γ)→R with wrap)
 ////////////////////////////////////////////////////////////////////////////////
 window.addEventListener('deviceorientation', e => {
   if (e.alpha != null) {
-    yaw   = e.alpha;   // 0..360
-    pitch = e.beta;    // -180..180
-    roll  = e.gamma;   // -90..90
+    // α = yaw (0..360), β = pitch (-180..180), γ = roll (-90..90)
+    yaw   = e.alpha;
+    pitch = e.beta;
+    roll  = e.gamma;
     orientEl.textContent = `Yaw ${yaw.toFixed(0)}°  Pitch ${pitch.toFixed(0)}°  Roll ${roll.toFixed(0)}°`;
   }
 }, true);
@@ -273,28 +316,44 @@ btnCenter.addEventListener('click', () => {
   baseYaw = yaw; basePitch = pitch; baseRoll = roll;
 });
 
+function getRelativeAngles() {
+  if (baseYaw==null || basePitch==null || baseRoll==null) return {X:0,P:0,R:0};
+  // wrap-around friendly deltas (360 ↔ 0 handled)
+  const dYaw   = wrap180(yaw   - baseYaw);
+  const dPitch = wrap180(pitch - basePitch);
+  const dRoll  = wrap180(roll  - baseRoll);
+
+  // map to command ranges (with your sign conventions):
+  // X: negative = look right, positive = look left
+  const X = clamp(-dYaw   * GAIN_YAW  , -400, 400);
+  // P: + up, - down
+  const P = clamp( dPitch * GAIN_PITCH, -400, 400);
+  // R: - right tilt, + left tilt
+  const R = clamp( dRoll  * GAIN_ROLL , -400, 400);
+  return {X,P,R};
+}
+
 ////////////////////////////////////////////////////////////////////////////////
-// 4) Home button: send HOME and pause streaming for 5 seconds
+// 4) HOME button: send and pause streaming for 5s
 ////////////////////////////////////////////////////////////////////////////////
 btnHome.addEventListener('click', () => {
   if (!socket || socket.disconnected) return;
-  // reset transient translations
   trans = {Y:0,Z:0,H:0};
-  // show HOME and send
   cmdEl.textContent = "HOME";
   socket.emit('broadcast-message', { message: "HOME" });
-  // pause streaming for 5 seconds
   pauseUntil = now() + 5000;
 });
 
 ////////////////////////////////////////////////////////////////////////////////
 // 5) command synthesis & streaming (adjustable interval)
 ////////////////////////////////////////////////////////////////////////////////
+function decay(v){ return Math.abs(v) < 1 ? 0 : v*DECAY; }
+
 function tick() {
   if (!socket || socket.disconnected) return;
   if (now() < pauseUntil) return; // paused after HOME
 
-  // map motion impulses → transient translations, then decay toward 0
+  // motion impulses → transient translations
   //   forward/back  : accel.y -> Z (− forward, + backward)
   //   up/down       : accel.z -> H (0..50)
   //   left/right    : accel.x -> Y (− left, + right)
@@ -302,9 +361,20 @@ function tick() {
   trans.H = clamp(decay(trans.H + ( accel.z* 2)),   0,  50);
   trans.Y = clamp(decay(trans.Y + ( accel.x*10)), -400, 400);
 
-  const {X,P,R} = getRelativeAngles();
-  const cmd = `X${X.toFixed(0)},Y${trans.Y.toFixed(0)},Z${trans.Z.toFixed(0)},` +
-              `H${trans.H.toFixed(0)},S1,A1,R${R.toFixed(0)},P${P.toFixed(0)}`;
+  const {X, P, R} = getRelativeAngles();
+
+  // apply sign flips
+  const Xo = flips.X * X;
+  const Yo = flips.Y * trans.Y;
+  const Zo = flips.Z * trans.Z;
+  let   Ho = trans.H;
+  if (flips.H === -1) Ho = 50 - Ho;     // mirror within 0..50
+  Ho = clamp(Ho, 0, 50);
+  const Po = flips.P * P;
+  const Ro = flips.R * R;
+
+  const cmd = `X${Xo.toFixed(0)},Y${Yo.toFixed(0)},Z${Zo.toFixed(0)},` +
+              `H${Ho.toFixed(0)},S1,A1,R${Ro.toFixed(0)},P${Po.toFixed(0)}`;
   cmdEl.textContent = cmd;
 
   socket.emit('broadcast-message', { message: cmd });
@@ -314,19 +384,12 @@ function scheduleTick() {
   if (intervalTimer) clearInterval(intervalTimer);
   intervalTimer = setInterval(tick, sendIntervalMs);
 }
-scheduleTick(); // start loop immediately; will no-op until connected
+scheduleTick();
 
 ////////////////////////////////////////////////////////////////////////////////
-// 6) networking helpers: bind per-socket handlers
+// 6) frames: dynamic per-robot subscriptions
 ////////////////////////////////////////////////////////////////////////////////
-function wireCommonHandlers(s) {
-  s.on('connect',      () => setStatus('🟢'));
-  s.on('disconnect',   () => setStatus('🔴'));
-  s.on('connect_error',() => setStatus('🔴'));
-}
-
 function updateImg(imgEl, oldUrlRefName, payload, mime) {
-  // payload may be ArrayBuffer/Uint8Array/Blob
   const blob = payload instanceof Blob ? payload : new Blob([payload], { type: mime });
   const url = URL.createObjectURL(blob);
   imgEl.src = url;
@@ -334,41 +397,105 @@ function updateImg(imgEl, oldUrlRefName, payload, mime) {
   window[oldUrlRefName] = url;
 }
 
-function wireFrameHandlers(s) {
-  // clean previous handlers to avoid dupes on reconnect
-  s.off('frame-color'); s.off('frame-depth');
+function unsubscribeDynamic() {
+  if (!socket || !subscribedUuid) return;
+  socket.off(`/${subscribedUuid}_color`);
+  socket.off(`/${subscribedUuid}_depth`);
+  subscribedUuid = null;
+}
 
-  s.on('frame-color', (payload) => {
-    updateImg(imgColor, 'urlColor', payload, 'image/jpeg');
-  });
-  s.on('frame-depth', (payload) => {
-    updateImg(imgDepth, 'urlDepth', payload, 'image/png');
-  });
+function subscribeDynamic(uuid) {
+  if (!socket) return;
+  if (subscribedUuid === uuid) return;
+  unsubscribeDynamic();
+  subscribedUuid = uuid;
+  whichRobot.textContent = `robot: ${uuid}`;
+  socket.on(`/${uuid}_color`, (payload) => updateImg(imgColor, 'urlColor', payload, 'image/jpeg'));
+  socket.on(`/${uuid}_depth`, (payload) => updateImg(imgDepth, 'urlDepth', payload, 'image/png'));
+}
+
+// Fallback legacy handlers if no target robot is known
+function wireLegacyHandlers(s) {
+  s.off('frame-color'); s.off('frame-depth');
+  s.on('frame-color', (payload) => { if (!subscribedUuid) updateImg(imgColor, 'urlColor', payload, 'image/jpeg'); });
+  s.on('frame-depth', (payload) => { if (!subscribedUuid) updateImg(imgDepth, 'urlDepth', payload, 'image/png'); });
+}
+
+function chooseTargetFromList(list) {
+  // track sid→uuid map
+  sidToUuid.clear();
+  list.forEach(p => { if (p.id && p.uuid) sidToUuid.set(p.id, p.uuid); });
+
+  // keep target if still present
+  if (targetUuid && [...sidToUuid.values()].includes(targetUuid)) {
+    subscribeDynamic(targetUuid);
+    return;
+  }
+
+  // pick first other (not me)
+  const candidates = list.filter(p => p.uuid && p.uuid !== myUuid);
+  if (candidates.length > 0) {
+    targetUuid = candidates[0].uuid;
+    st.setItem('neck_target_uuid', targetUuid);
+    subscribeDynamic(targetUuid);
+  } else {
+    // nobody to subscribe — show legacy if agent broadcasts there
+    whichRobot.textContent = 'robot: —';
+    unsubscribeDynamic();
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// 7) networking: WS-only auth strategy
-//    - Try JWT if present
-//    - Else use {uuid,password} directly via WS auth
+// 7) networking: WS-only auth (JWT if present; else ws+password)
 ////////////////////////////////////////////////////////////////////////////////
+function wirePresenceHandlers(s) {
+  s.on('existing-peers', (arr) => chooseTargetFromList(arr || []));
+  s.on('new-peer', (info) => {
+    if (info && info.id && info.uuid) {
+      sidToUuid.set(info.id, info.uuid);
+      if (!targetUuid && info.uuid !== myUuid) {
+        targetUuid = info.uuid; st.setItem('neck_target_uuid', targetUuid);
+        subscribeDynamic(targetUuid);
+      }
+    }
+  });
+  s.on('peer-disconnect', (sid) => {
+    const u = sidToUuid.get(sid);
+    sidToUuid.delete(sid);
+    if (u && u === targetUuid) {
+      targetUuid = null; st.removeItem('neck_target_uuid');
+      whichRobot.textContent = 'robot: —';
+      unsubscribeDynamic();
+    }
+  });
+}
+
+function wireCommonHandlers(s) {
+  s.on('connect',      () => setStatus('🟢'));
+  s.on('disconnect',   () => { setStatus('🔴'); whichRobot.textContent = 'robot: —'; });
+  s.on('connect_error',() => setStatus('🔴'));
+  wirePresenceHandlers(s);
+  wireLegacyHandlers(s);
+}
+
 function connectWS_withToken() {
   return new Promise((resolve,reject)=>{
     const s = io(serverURL, {
       path: SIO_PATH,
-      auth: { token: jwtToken },       // JWT string
+      auth: { token: jwtToken },
       transports: ['websocket']
     });
     let settled = false;
     wireCommonHandlers(s);
-    wireFrameHandlers(s);
-
     s.on('connect', () => { socket = s; setStatus('🟢'); settled = true; resolve('token'); });
     s.on('connect_error',(err) => { if (!settled) { s.close(); reject(err); } });
   });
 }
+
 function connectWS_withPassword() {
   return new Promise((resolve,reject)=>{
     const uuid = 'phone-' + Date.now().toString(36);
+    myUuid = uuid; st.setItem('neck_my_uuid', myUuid);
     const s = io(serverURL, {
       path: SIO_PATH,
       auth: { uuid, password: sharedPW },
@@ -376,8 +503,6 @@ function connectWS_withPassword() {
     });
     let settled = false;
     wireCommonHandlers(s);
-    wireFrameHandlers(s);
-
     s.on('connect', () => { socket = s; setStatus('🟢'); settled = true; resolve('password'); });
     s.on('connect_error',(err) => { if (!settled) { s.close(); reject(err); } });
   });
@@ -410,6 +535,10 @@ async function boot() {
   // auto-calibrate once after 1s if not already done
   setTimeout(() => { if (baseYaw==null) btnCenter.click(); }, 1000);
 }
+
+// auto-show settings on first load
+if (!(st.getItem('neck_server') && st.getItem('neck_pw'))) cfgDlg.hidden = false;
+else boot();
 </script>
 </body>
 </html>

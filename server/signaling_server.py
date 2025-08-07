@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 signaling_server.py  –  JWT-secured Flask-SocketIO + LocalTunnel broker
-(… docstring unchanged …)
+Adds per-peer dynamic frame endpoints:
+  • Agent emits to:   "frame-color" / "frame-depth"  (unchanged)
+  • Server re-emits:  "/<uuid>_color" and "/<uuid>_depth" (binary)
+Clients that want a specific robot’s stream should listen to those dynamic events.
 """
 # ──────────────────────────────────────────────────────────────────────
 # I.  bootstrap into a v-env (std-lib only)
@@ -16,11 +19,10 @@ PY_VENV    = BIN_DIR / "python"
 REQS       = ["flask", "flask-cors", "flask-socketio", "eventlet", "PyJWT"]
 
 def running_inside_venv() -> bool:
-    # robust even if python in venv is a symlink
     return Path(sys.executable).resolve() == PY_VENV.resolve()
 
 def create_venv_once():
-    if VENV_DIR.exists():  # already created, nothing to do
+    if VENV_DIR.exists():
         return
     print("→ Creating virtual-env …")
     import venv; venv.EnvBuilder(with_pip=True).create(VENV_DIR)
@@ -43,25 +45,20 @@ def ensure_deps_inside_venv():
     if missing:
         print("→ Installing missing deps inside venv:", ", ".join(missing))
         subprocess.check_call([str(PY_VENV), "-m", "pip", "install", *missing])
-        # re-exec once so the fresh modules are importable in the current process
         os.execv(str(PY_VENV), [str(PY_VENV), *sys.argv])
 
-# ––– main bootstrap flow –––
 if not running_inside_venv():
     create_venv_once()
-    # jump into the v-env; everything else below runs only there
     os.execv(str(PY_VENV), [str(PY_VENV), *sys.argv])
 
-# we are now inside the v-env – double-check deps (covers transient pip failures)
 ensure_deps_inside_venv()
-
 
 # ──────────────────────────────────────────────────────────────────────
 # II. heavy imports (after v-env) & monkey-patch
 # ──────────────────────────────────────────────────────────────────────
 import eventlet; eventlet.monkey_patch()
 
-import json, random, re, select, fcntl, shutil, time, threading, secrets, argparse
+import json, re, select, fcntl, shutil, time, threading, secrets, argparse
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 import urllib.request, subprocess
@@ -109,7 +106,6 @@ cors_raw = ask_once(
 )
 subdomain = ask_once("subdomain", "Desired LocalTunnel sub-domain prefix:\n> ")
 
-# CLI overrides
 cli = argparse.ArgumentParser()
 cli.add_argument("-p", "--port", type=int, help="listen port")
 cli.add_argument("-s", "--subdomain", help="LocalTunnel sub-domain prefix")
@@ -152,7 +148,6 @@ while True:
 
 print("→ Public URL:", PUBLIC_URL)
 
-# persist config
 cfg.update({"port": PORT, "subdomain": SUBDOMAIN,
             "cors_origins": cors_raw,
             "localtunnel_domain": urlparse(PUBLIC_URL).netloc})
@@ -169,7 +164,8 @@ app      = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ALLOWED}})
 socketio = SocketIO(app, cors_allowed_origins=ALLOWED, async_mode="eventlet")
 
-clients: dict[str, dict] = {}         # sid → {"uuid": str, "roles": [str]}
+# sid → {uuid:str, roles:[str]}
+clients: dict[str, dict] = {}
 def roles_ok(sid: str, role: str) -> bool:
     return role in clients.get(sid, {}).get("roles", [])
 
@@ -192,31 +188,26 @@ def login():
 def _connect(auth):
     token = isinstance(auth, dict) and auth.get("token")
 
-    # NEW: WS-only fallback — authenticate by shared password (no JWT)
+    # WS-only password path (no POST) for browsers/phones
     if not token and isinstance(auth, dict) and auth.get("password"):
         if auth["password"] == PEER_PW:
             sid = request.sid
             uid = auth.get("uuid") or "-".join(secrets.token_hex(2) for _ in range(4))
             clients[sid] = {"uuid": uid, "roles": ["peer"]}
             print(f"[+] {sid} ({uid}) connected via ws+password")
-
-            # notify others except sender
             socketio.emit("new-peer", {"id": sid, **clients[sid]}, skip_sid=sid)
-            # send existing list to the new peer
             socketio.emit("existing-peers",
                           [{"id": pid, **info} for pid, info in clients.items() if pid != sid],
                           to=sid)
-            return  # accept connection
+            return
         else:
-            print("WS password invalid")
-            return False
+            print("WS password invalid"); return False
 
-    # existing JWT path (unchanged)
+    # JWT path
     try:
         claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except Exception as e:
-        print("JWT decode error:", e)
-        return False
+        print("JWT decode error:", e); return False
 
     sid = request.sid
     clients[sid] = {"uuid": claims["sub"], "roles": claims.get("roles", [])}
@@ -225,15 +216,6 @@ def _connect(auth):
     socketio.emit("existing-peers",
                   [{"id": pid, **info} for pid, info in clients.items() if pid != sid],
                   to=sid)
-
-@socketio.on("frame-color")
-def _relay_color(data):
-    # `data` is bytes; re-emit to all except sender
-    socketio.emit("frame-color", data, skip_sid=request.sid)
-
-@socketio.on("frame-depth")
-def _relay_depth(data):
-    socketio.emit("frame-depth", data, skip_sid=request.sid)
 
 @socketio.on("disconnect")
 def _disconnect():
@@ -255,6 +237,36 @@ def _broadcast(data):
     sid = request.sid
     if not roles_ok(sid, "peer"): return
     socketio.emit("peer-message", {"peerId": sid, "message": data.get("message")}, skip_sid=sid)
+
+# ──────────────────────────────────────────────────────────────────────
+# NEW: Per-peer dynamic frame endpoints
+#   Agent → emits to "frame-color"/"frame-depth" (binary bytes)
+#   Server → re-emits to *both* legacy and dynamic:
+#            "frame-color"/"frame-depth" (legacy)
+#            "/<uuid>_color" and "/<uuid>_depth" (dynamic, binary)
+# Clients interested in a specific robot listen to those dynamic names.
+# ──────────────────────────────────────────────────────────────────────
+def _uuid_for_sid(sid: str) -> str | None:
+    info = clients.get(sid)
+    return info and info.get("uuid")
+
+@socketio.on("frame-color")
+def _relay_color(data):
+    sid = request.sid
+    uid = _uuid_for_sid(sid)
+    if not uid: return
+    # Legacy broadcast (all except sender)
+    socketio.emit("frame-color", data, skip_sid=sid)
+    # Dynamic, per-robot channel
+    socketio.emit(f"/{uid}_color", data, skip_sid=sid)
+
+@socketio.on("frame-depth")
+def _relay_depth(data):
+    sid = request.sid
+    uid = _uuid_for_sid(sid)
+    if not uid: return
+    socketio.emit("frame-depth", data, skip_sid=sid)
+    socketio.emit(f"/{uid}_depth", data, skip_sid=sid)
 
 # ──────────────────────────────────────────────────────────────────────
 # VII. heartbeat – restart if tunnel lost
