@@ -3,142 +3,143 @@
 user_interface.py — minimal REPL client for the neck (signaling peer).
 
 • First run:
-    - asks for signaling-server URL
-    - asks for a shared password (blank ⇒ random)
+    - asks for signaling-server URL & shared password
     - writes .env   and  config_interface.json
 • Always:
     - reloads settings automatically (CLI can override)
-    - relaunches itself inside ./int_venv  (created once)
-    - (re)installs deps in that venv if they’re missing
-    - keeps retrying /login until both server & neck_agent are ready
+    - relaunches itself inside ./int_venv  (created on first run)
+    - installs missing deps exactly once if ever absent
+    - keeps retrying /login until server & neck_agent are ready
 """
 from __future__ import annotations
-
-# ───────────────────────── std-lib imports ────────────────────────── #
 import os, sys, json, secrets, argparse, time, subprocess, pathlib
+from urllib.parse import urljoin
 
+# ────────────────────────── paths & constants ───────────────────────── #
 BASE_DIR   = pathlib.Path(__file__).resolve().parent
 ENV_PATH   = BASE_DIR / ".env"
 CFG_PATH   = BASE_DIR / "config_interface.json"
+VENV_DIR   = BASE_DIR / "int_venv"
+PY_VENV    = VENV_DIR / ("Scripts" if os.name == "nt" else "bin") / "python"
+REQS       = ["requests", "python-socketio[client]"]
 
-# ─────────────────────── 1) .env  (create / load) ─────────────────── #
+# ─────────────────────  0) helper: inside v-env?  ───────────────────── #
+def in_venv() -> bool:
+    """True when running from *any* virtual-env (robust)."""
+    return sys.prefix != sys.base_prefix   # standard venv litmus test
+
+def ensure_int_venv_once() -> None:
+    """Create venv + pip-install REQS the *first* time only."""
+    if VENV_DIR.exists():
+        return
+    print("[ui] creating int_venv …")
+    subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
+    print("[ui] installing deps …  (one-time)")
+    subprocess.check_call([str(PY_VENV), "-m", "pip", "install",
+                           "--quiet", "--upgrade", "pip", *REQS])
+
+# ─────────────────────  1) .env  (create / load)  ───────────────────── #
 if not ENV_PATH.exists():
-    jwt_secret   = secrets.token_urlsafe(32)
-    pw_input     = input("Enter shared password with signaling server (blank = random):\n> ").strip()
-    shared_pw    = pw_input or secrets.token_urlsafe(16)
-    ENV_PATH.write_text(
-        f"PEER_SHARED_SECRET={shared_pw}\n"        # client only needs the shared PW
-        f"# JWT_SECRET lives ONLY on the server\n"
-    )
-    print("[ui] created .env")
+    shared_pw = input("Shared password with signaling server (blank = random):\n> ").strip() \
+                or secrets.token_urlsafe(16)
+    ENV_PATH.write_text(f"PEER_SHARED_SECRET={shared_pw}\n")
+    print("[ui] wrote .env")
 
 for ln in ENV_PATH.read_text().splitlines():
     if "=" in ln and not ln.lstrip().startswith("#"):
         k, v = ln.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip())
 
-# ─────────────────────── 2) config_interface.json ──────────────────── #
-cfg: dict[str, str] = {}
-if CFG_PATH.exists():
-    cfg = json.loads(CFG_PATH.read_text())
+SHARED_PW = os.environ["PEER_SHARED_SECRET"]
 
-# ─────────────────────── 3) CLI / interactive prompts ─────────────── #
-ap = argparse.ArgumentParser(description="Neck REPL client via signaling server")
+# ───────────────────  2) config_interface.json  ────────────────────── #
+cfg: dict[str, str] = json.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
+
+# ───────────────────  3) CLI parsing & prompts  ────────────────────── #
+ap = argparse.ArgumentParser(description="Neck REPL client")
 ap.add_argument("-s", "--server-url", help="Signaling-server base URL")
 ap.add_argument("-u", "--uuid",       help="Your peer UUID")
 cli = ap.parse_args()
 
-def ask(prompt: str) -> str:
-    return input(prompt).strip()
+def ask(prompt: str) -> str: return input(prompt).strip()
 
-server_url = (cli.server_url or cfg.get("server_url") or ask("Signaling server URL:\n> ")).rstrip("/")
-uuid       = (cli.uuid       or cfg.get("uuid")       or ask("Your UUID (blank=random):\n> ") or
-              "-".join(secrets.token_hex(2) for _ in range(4)))
+server_url = (cli.server_url or cfg.get("server_url")
+              or ask("Signaling server URL:\n> ")).rstrip("/")
+uuid       = (cli.uuid or cfg.get("uuid")
+              or ask("Your UUID (blank = random):\n> ")
+              or "-".join(secrets.token_hex(2) for _ in range(4)))
 
 cfg.update(server_url=server_url, uuid=uuid)
 CFG_PATH.write_text(json.dumps(cfg, indent=4))
 
-# ─────────────────────── 4) bootstrap int_venv ────────────────────── #
-VENV_DIR   = BASE_DIR / "int_venv"
-PY_VENV    = VENV_DIR / ("Scripts" if os.name == "nt" else "bin") / "python"
+# ───────────────────  4) ensure we are running inside v-env  ───────── #
+if not in_venv():
+    ensure_int_venv_once()
+    # re-exec inside the freshly created / existing v-env
+    os.execv(str(PY_VENV), [str(PY_VENV), *sys.argv])
 
-def inside_venv() -> bool:
-    return pathlib.Path(sys.executable).resolve() == PY_VENV.resolve()
+# (   From here down we **are** inside the v-env   ) ------------------- #
 
-REQS = ["requests", "python-socketio[client]"]
-
-if not inside_venv():
-    if not VENV_DIR.exists():
-        print("[ui] creating int_venv …")
-        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
-    # always try to install/upgrade deps when *leaving* host python
-    subprocess.check_call([str(PY_VENV), "-m", "pip", "install", "--quiet", "--upgrade", "pip", *REQS])
-    os.execv(str(PY_VENV), [str(PY_VENV), *sys.argv])   # re-exec inside venv
-
-# 4b) even inside the venv, re-check and install anything missing —— #
+# ───────────────────  4b) install *missing* deps once  ─────────────── #
 missing: list[str] = []
-for pkg, mod in [("requests", "requests"), ("python-socketio[client]", "socketio")]:
-    try:
-        __import__(mod)
-    except ModuleNotFoundError:
-        missing.append(pkg)
+try:
+    import requests          # type: ignore
+except ImportError:
+    missing.append("requests")
+
+try:
+    import socketio          # type: ignore
+except ImportError:
+    missing.append("python-socketio[client]")
 
 if missing:
-    print("[ui] installing missing deps inside venv:", ", ".join(missing))
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *missing])
-    os.execv(sys.executable, [sys.executable, *sys.argv])   # restart once with deps
+    print("[ui] missing deps detected – installing:", ", ".join(missing))
+    subprocess.check_call([sys.executable, "-m", "pip", "install",
+                           "--quiet", *missing])
+    # relaunch once with deps present
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
-# ─────────────────────── 5) runtime logic  ────────────────────────── #
-import requests, socketio
-from urllib.parse import urljoin
+# ───────────────────  5) runtime logic (login loop)  ───────────────── #
+import requests, socketio   # noqa: E402  (after deps ensured)
 
 LOGIN_URL = urljoin(server_url + "/", "login")
-SHARED_PW = os.environ["PEER_SHARED_SECRET"]
 
-def try_login() -> "str | None":      # keep as str|None under Py≥3.10, fine on Py3.8/3.9
+def try_login() -> str | None:
     try:
         r = requests.post(LOGIN_URL, json={"uuid": uuid, "password": SHARED_PW}, timeout=5)
-        if r.status_code == 200 and "token" in r.json():
+        if r.status_code == 200:
             return r.json()["token"]
-        msg = "bad credentials" if r.status_code == 401 else f"HTTP {r.status_code}: {r.text.strip()}"
+        msg = "bad credentials" if r.status_code == 401 else f"HTTP {r.status_code}"
         print(f"[ui] /login → {msg}")
-    except Exception as e:
+    except Exception as e:   # noqa: BLE001
         print(f"[ui] /login unreachable: {e}")
     return None
 
 print(f"[ui] contacting {LOGIN_URL}")
-token = None
+token: str | None = None
 while token is None:
     token = try_login() or (time.sleep(3) or None)
-
 print("[ui] JWT acquired ✓")
 
-# ─────────────────────── 6) Socket.IO client  ─────────────────────── #
-sio = socketio.Client(reconnection=True)
+# ───────────────────  6) Socket.IO  + REPL  ────────────────────────── #
+sio = socketio.Client(reconnection=True, logger=False)
 
 @sio.event
-def connect():
-    print("[ui] WS connected")
-
+def connect():    print("[ui] WS connected")
 @sio.event
-def disconnect():
-    print("[ui] WS disconnected")
-
+def disconnect(): print("[ui] WS disconnected")
 @sio.on("peer-message")
-def _on_peer(data):
-    print(f"[ui] ← {data}")
+def _peer(data):  print(f"[ui] ← {data}")
 
-connected = False
-while not connected:
+while True:
     try:
         sio.connect(server_url, auth={"token": token})
-        connected = True
-    except Exception as e:
+        break
+    except Exception as e:                        # noqa: BLE001
         print(f"[ui] WS connect error: {e}")
         time.sleep(3)
 
-# ─────────────────────── 7) REPL loop  ─────────────────────────────── #
-print("\n[ui] READY — type neck commands, or 'quit' to exit.\n")
+print("\n[ui] READY — type commands or 'quit'.\n")
 try:
     while True:
         cmd = input("> ").strip()
