@@ -6,7 +6,12 @@
 
 <style>
   :root { color-scheme: dark; }
+  html, body {
+    height: 100%; width: 100%; overflow: hidden;position:relative;margin:unset;
+  }
   body {
+    height:100%;
+    display: block;
     margin: 0; background: #111; color: #fafafa;
     font: 16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   }
@@ -22,7 +27,7 @@
     padding: .45rem .7rem; font: inherit;
   }
   button:hover { background: #222; }
-  main { max-width: 1200px; margin: 0 auto; padding: .75rem; display: grid; gap: .75rem; }
+  main { position:relative;width:100%; margin: 0 auto; height:100%;bottom:0px; display: grid; gap: .75rem; }
   .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Roboto Mono", monospace; }
   .panel {
@@ -36,9 +41,8 @@
     position: relative;
   }
   .frame .pad {
-    /* default reserve 16:9 until first frame sets exact aspect-ratio */
     width: 100%;
-    aspect-ratio: 16 / 9;
+    aspect-ratio: 16 / 9; /* replaced when first frame lands */
     background: #0a0a0a;
     display: grid; place-items: center;
   }
@@ -87,13 +91,15 @@
   </header>
 
   <main>
-    <section class="panel">
+              <canvas id="poseCanvas"></canvas>
+
+    <section class="panel" style="display:none;">
       <div class="row">
         <div class="muted">Live Feeds</div>
         <div class="muted mono" id="whichRobot" style="margin-left:auto;">robot: —</div>
       </div>
 
-      <div class="grid2">
+      <div class="grid2" style="display:none;">
         <div class="frame">
           <div class="muted mono" style="padding:.4rem .5rem;">Color</div>
           <div id="wrapColor" class="pad"><img id="imgColor" alt="color"></div>
@@ -106,10 +112,10 @@
 
       <div class="grid2" style="margin-top:.75rem;">
         <div id="poseWrap" class="panel" style="min-height: 260px;">
-          <div class="muted mono" style="margin-bottom:.5rem;">Phone Pose</div>
+          <div class="muted mono" style="margin-bottom:.5rem;">Phone Pose + Depth Mesh</div>
           <canvas id="poseCanvas"></canvas>
         </div>
-        <div class="panel">
+        <div class="panel" style="display:none;">
           <div class="row mono">
             <div id="orient">Yaw 0° &nbsp; Pitch 0° &nbsp; Roll 0°</div>
           </div>
@@ -323,7 +329,7 @@ const corrQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0
 
 // Build corrected quaternion from (alpha, beta, gamma)
 function deviceToQuat(alpha, beta, gamma) {
-  // As per your reference: Euler(b, a, -g, "YXZ") then correct around X by -π/2
+  // Euler(b, a, -g, "YXZ") then correct around X by -π/2
   const e = new THREE.Euler(rad(beta), rad(alpha), -rad(gamma), 'YXZ');
   const q = new THREE.Quaternion().setFromEuler(e);
   q.multiply(corrQuat);
@@ -338,7 +344,7 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0a0a0a);
 const cam = new THREE.PerspectiveCamera(55, 16/9, 0.1, 50);
-cam.position.set(0, 0.8, 2.2);
+cam.position.set(0, 0, 4.2);
 scene.add(cam);
 
 const light = new THREE.HemisphereLight(0xffffff, 0x222222, 1.0);
@@ -349,14 +355,73 @@ scene.add(dir);
 
 // Phone “slab”
 const phoneGeom = new THREE.BoxGeometry(0.7, 1.4, 0.05);
-const phoneMat  = new THREE.MeshStandardMaterial({ color: 0x2e6cff, metalness: 0.1, roughness: 0.9 });
+const phoneMat  = new THREE.MeshBasicMaterial({ color: 0x111111, wireframe: true, transparency: true, opacity: 0.1 });
 const phoneMesh = new THREE.Mesh(phoneGeom, phoneMat);
+phoneMesh.position.set(0, -0.5, 0.15); // tuck to the side so it doesn't block the depth mesh
 scene.add(phoneMesh);
 
 // A ground grid for reference
 const grid = new THREE.GridHelper(10, 10, 0x333333, 0x222222);
 grid.position.y = -1;
 scene.add(grid);
+
+// Depth mesh infra (portrait frames → keep aspect)
+let depthCanvas = document.createElement('canvas');
+let depthCtx = depthCanvas.getContext('2d', { willReadFrequently: true });
+
+let colorTex = new THREE.Texture();
+colorTex.colorSpace = THREE.SRGBColorSpace;
+colorTex.minFilter = THREE.LinearFilter;
+colorTex.magFilter = THREE.LinearFilter;
+colorTex.wrapS = colorTex.wrapT = THREE.ClampToEdgeWrapping;
+colorTex.flipY = true;  // flip the color image vertically
+
+let depthMesh = null;
+let depthGeom = null;
+let posAttr = null;
+let posArr = null;
+let gridW = 0, gridH = 0;
+let srcW = 0, srcH = 0;
+const DIV = 3;          // downsample factor (higher = fewer verts)
+let depthScale = 0.28;  // world Z displacement at white
+
+function ensureDepthGeometry(w, h) {
+  // Rebuild once if no mesh or dims changed
+  if (depthMesh && w === srcW && h === srcH) return;
+
+  // cleanup if exists
+  if (depthMesh) {
+    scene.remove(depthMesh);
+    depthMesh.geometry.dispose();
+    depthMesh.material.dispose();
+  }
+
+  srcW = w; srcH = h;
+  depthCanvas.width = srcW; depthCanvas.height = srcH;
+
+  // world size near plane: fit nicely in the pose view area
+  const WORLD_H = 3;
+  const WORLD_W = WORLD_H * (srcW / srcH);
+
+  gridW = Math.max(2, Math.round(srcW / DIV));
+  gridH = Math.max(2, Math.round(srcH / DIV));
+
+  depthGeom = new THREE.PlaneGeometry(WORLD_W, WORLD_H, gridW - 1, gridH - 1);
+
+    // 🔻 flip V (y) in UVs so color isn’t upside-down
+    const uv = depthGeom.getAttribute('uv');
+    for (let i = 0; i < uv.count; i++) {
+    uv.setY(i, 1 - uv.getY(i));
+    }
+    uv.needsUpdate = true;
+
+  posAttr = depthGeom.getAttribute('position');
+  posArr  = posAttr.array;
+
+  const mat = new THREE.MeshBasicMaterial({ map: colorTex, side: THREE.DoubleSide });
+  depthMesh = new THREE.Mesh(depthGeom, mat);
+  scene.add(depthMesh);
+}
 
 function resizePose() {
   const rect = poseCanvas.parentElement.getBoundingClientRect();
@@ -464,10 +529,53 @@ function scheduleTick() {
 scheduleTick();
 
 ////////////////////////////////////////////////////////////////////////////////
-// 6) Frames: respect aspect ratio based on actual frame sizes
+// 6) Frames: respect aspect ratio (UI) + feed Three.js depth mesh/texture
 ////////////////////////////////////////////////////////////////////////////////
+function blobFromPayload(payload, mime) {
+  return (payload instanceof Blob) ? payload : new Blob([payload], { type: mime });
+}
+
+async function updateColorTextureFromBlob(blob) {
+  try {
+    const bmp = await createImageBitmap(blob, { imageOrientation: 'none' });
+    // If depth mesh isn't built yet, build it off color dims (depth can rebuild later if needed)
+    ensureDepthGeometry(bmp.width, bmp.height);
+    colorTex.image = bmp;
+    colorTex.needsUpdate = true;
+  } catch (e) { /* ignore */ }
+}
+
+async function updateDepthFromBlob(blob) {
+  try {
+    const bmp = await createImageBitmap(blob, { imageOrientation: 'none' });
+    ensureDepthGeometry(bmp.width, bmp.height);
+    depthCtx.drawImage(bmp, 0, 0, srcW, srcH);
+    const id = depthCtx.getImageData(0, 0, srcW, srcH);
+    const data = id.data; // RGBA (grayscale → R==G==B)
+
+    // lazily guarded
+    if (!posAttr) return;
+
+    // Map grid → source pixels
+    for (let gy = 0; gy < gridH; gy++) {
+      const sy = Math.min(srcH - 1, Math.round(gy * (srcH - 1) / (gridH - 1)));
+      for (let gx = 0; gx < gridW; gx++) {
+        const sx = Math.min(srcW - 1, Math.round(gx * (srcW - 1) / (gridW - 1)));
+        const p = (sy * srcW + sx) * 4;
+        const lum = data[p]; // 0..255 (white near)
+        const z = (lum / 255) * depthScale;
+
+        // position attribute is interleaved xyz
+        const i = (gy * gridW + gx) * 3 + 2; // z index
+        posArr[i] = z;
+      }
+    }
+    posAttr.needsUpdate = true;
+  } catch (e) { /* ignore */ }
+}
+
 function updateImg(imgEl, wrapEl, oldUrlRefName, payload, mime) {
-  const blob = payload instanceof Blob ? payload : new Blob([payload], { type: mime });
+  const blob = blobFromPayload(payload, mime);
   const url = URL.createObjectURL(blob);
   const tmp = new Image();
   tmp.onload = () => {
@@ -477,8 +585,12 @@ function updateImg(imgEl, wrapEl, oldUrlRefName, payload, mime) {
   };
   tmp.src = url;
 
-  imgEl.onload = () => { /* nothing; image shows with object-fit: contain */ };
+  imgEl.onload = () => { /* keep preview */ };
   imgEl.src = url;
+
+  // ALSO: feed Three.js
+  if (imgEl === imgColor) updateColorTextureFromBlob(blob);
+  else if (imgEl === imgDepth) updateDepthFromBlob(blob);
 
   if (window[oldUrlRefName]) URL.revokeObjectURL(window[oldUrlRefName]);
   window[oldUrlRefName] = url;
