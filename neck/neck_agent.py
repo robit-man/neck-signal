@@ -261,7 +261,7 @@ class CameraStreamer:
 
     def _loop_color(self):
         session = requests.Session()
-        target_size = (640, 360)
+        target_size = (360, 640)
         while not self._stop.is_set():
             t0 = time.time()
             try:
@@ -291,7 +291,7 @@ class CameraStreamer:
 
     def _loop_depth(self):
         session = requests.Session()
-        target_size = (640, 360)
+        target_size = (360, 640)
         while not self._stop.is_set():
             t0 = time.time()
             try:

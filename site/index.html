@@ -22,15 +22,36 @@
     padding: .45rem .7rem; font: inherit;
   }
   button:hover { background: #222; }
-  main { max-width: 1100px; margin: 0 auto; padding: .75rem; display: grid; gap: .75rem; }
+  main { max-width: 1200px; margin: 0 auto; padding: .75rem; display: grid; gap: .75rem; }
   .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Roboto Mono", monospace; }
   .panel {
     border: 1px solid #333; border-radius: .5rem; padding: .75rem; background: #121212;
   }
-  .images { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
-  .images img { width: 100%; height: auto; display: block; background: #0a0a0a; border: 1px solid #222; }
   .muted { opacity: .7; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+  .frame {
+    border: 1px solid #222; background: #0a0a0a; border-radius: .35rem; overflow: hidden;
+    position: relative;
+  }
+  .frame .pad {
+    /* default reserve 16:9 until first frame sets exact aspect-ratio */
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #0a0a0a;
+    display: grid; place-items: center;
+  }
+  .frame img {
+    width: 100%; height: 100%; object-fit: contain; display: block;
+    background: #000;
+  }
+
+  /* Phone pose (Three.js) */
+  #poseWrap {
+    border: 1px solid #222; border-radius: .35rem; overflow: hidden;
+  }
+  #poseCanvas { width: 100%; height: 100%; display: block; }
 
   /* Settings modal */
   #configDlg[hidden] { display: none; }
@@ -43,7 +64,6 @@
     padding: 1rem; display: grid; gap: .85rem;
   }
   .grid { display: grid; gap: .5rem; }
-  label small { display:block; opacity:.8; }
   .rangeRow {
     display:grid; gap:.5rem; grid-template-columns: 1fr minmax(4.5rem, 6rem);
     align-items:center;
@@ -72,19 +92,31 @@
         <div class="muted">Live Feeds</div>
         <div class="muted mono" id="whichRobot" style="margin-left:auto;">robot: —</div>
       </div>
-      <div class="images">
-        <div>
-          <div class="muted mono">Color</div>
-          <img id="imgColor" alt="color stream">
+
+      <div class="grid2">
+        <div class="frame">
+          <div class="muted mono" style="padding:.4rem .5rem;">Color</div>
+          <div id="wrapColor" class="pad"><img id="imgColor" alt="color"></div>
         </div>
-        <div>
-          <div class="muted mono">Depth</div>
-          <img id="imgDepth" alt="depth stream">
+        <div class="frame">
+          <div class="muted mono" style="padding:.4rem .5rem;">Depth</div>
+          <div id="wrapDepth" class="pad"><img id="imgDepth" alt="depth"></div>
         </div>
       </div>
-      <div class="row mono">
-        <div id="orient" class="panel">Yaw 0° &nbsp; Pitch 0° &nbsp; Roll 0°</div>
-        <div id="cmd" class="panel">X0,Y0,Z0,H0,S1,A1,R0,P0</div>
+
+      <div class="grid2" style="margin-top:.75rem;">
+        <div id="poseWrap" class="panel" style="min-height: 260px;">
+          <div class="muted mono" style="margin-bottom:.5rem;">Phone Pose</div>
+          <canvas id="poseCanvas"></canvas>
+        </div>
+        <div class="panel">
+          <div class="row mono">
+            <div id="orient">Yaw 0° &nbsp; Pitch 0° &nbsp; Roll 0°</div>
+          </div>
+          <div class="row mono" style="margin-top:.5rem;">
+            <div id="cmd">X0,Y0,Z0,H0,S1,A1,R0,P0</div>
+          </div>
+        </div>
       </div>
     </section>
   </main>
@@ -138,7 +170,10 @@
     </div>
   </div>
 
-<script>
+<!-- Main logic (module so we can import three.js) -->
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.175.0/build/three.module.js";
+
 ////////////////////////////////////////////////////////////////////////////////
 // 0) Utility & globals
 ////////////////////////////////////////////////////////////////////////////////
@@ -161,8 +196,11 @@ const btnHome    = document.getElementById('btnHome');
 
 const imgColor = document.getElementById('imgColor');
 const imgDepth = document.getElementById('imgDepth');
+const wrapColor = document.getElementById('wrapColor');
+const wrapDepth = document.getElementById('wrapDepth');
 let urlColor = null, urlDepth = null;
 
+// flips
 const flipBoxes = {
   X: document.getElementById('flipX'),
   Y: document.getElementById('flipY'),
@@ -185,50 +223,39 @@ let targetUuid = st.getItem('neck_target_uuid') || null;
 const sidToUuid = new Map();
 let subscribedUuid = null;
 
-// orientation baseline + live values (deg)
-let baseYaw=null, basePitch=null, baseRoll=null;
+// orientation baseline + live
 let yaw=0, pitch=0, roll=0;
+let baseQuat = null;            // THREE.Quaternion
+let curQuat  = new THREE.Quaternion();
 
 // acceleration & transient translations
 let accel = {x:0,y:0,z:0};
 let trans = {Y:0,Z:0,H:0};
 
 // streaming control
-let sendIntervalMs = Number(st.getItem('neck_rate_ms') || 100); // default 100ms
+let sendIntervalMs = Number(st.getItem('neck_rate_ms') || 100);
 let intervalTimer = null;
-let pauseUntil = 0; // ms timestamp; while in the future, streaming is paused
+let pauseUntil = 0;
 
 // sign flip map (multipliers)
 const flipsDefault = { X:1, Y:1, Z:1, H:1, P:1, R:1 };
 let flips = loadFlips();
 
 // tuning
-const GAIN_YAW   = 8;   // deg → units
+const GAIN_YAW   = 8;
 const GAIN_PITCH = 8;
 const GAIN_ROLL  = 8;
 
-const DECAY = 0.90;     // exponential decay for transients
+const DECAY = 0.90;
 
 // helpers
 const clamp   = (v,min,max)=>Math.min(max,Math.max(min,v));
 const setStatus = (emoji)=>{ statusEl.textContent = emoji; };
-const wrap180 = a => ((a+540)%360)-180;          // normalize to (-180,180]
 const now = ()=>Date.now();
-
-function loadFlips() {
-  try { return Object.assign({}, flipsDefault, JSON.parse(st.getItem('neck_flips') || '{}')); }
-  catch { return { ...flipsDefault }; }
-}
+function loadFlips() { try { return Object.assign({}, flipsDefault, JSON.parse(st.getItem('neck_flips') || '{}')); } catch { return { ...flipsDefault }; } }
 function saveFlips() { st.setItem('neck_flips', JSON.stringify(flips)); }
-function populateFlipUI(){
-  for (const k of Object.keys(flipBoxes)) flipBoxes[k].checked = flips[k] === -1;
-}
-for (const k of Object.keys(flipBoxes)) {
-  flipBoxes[k].addEventListener('change', () => {
-    flips[k] = flipBoxes[k].checked ? -1 : 1;
-    saveFlips();
-  });
-}
+function populateFlipUI(){ for (const k of Object.keys(flipBoxes)) flipBoxes[k].checked = flips[k] === -1; }
+for (const k of Object.keys(flipBoxes)) flipBoxes[k].addEventListener('change', () => { flips[k] = flipBoxes[k].checked ? -1 : 1; saveFlips(); });
 
 ////////////////////////////////////////////////////////////////////////////////
 // 1) iOS / browser sensor permissions
@@ -246,10 +273,7 @@ async function requestSensorPermissions() {
     return true;
   } catch { return true; }
 }
-btnPerms.addEventListener('click', async () => {
-  const ok = await requestSensorPermissions();
-  if (ok) btnPerms.disabled = true;
-});
+btnPerms.addEventListener('click', async () => { const ok = await requestSensorPermissions(); if (ok) btnPerms.disabled = true; });
 if (!/iphone|ipad|ipod/i.test(navigator.userAgent)) btnPerms.disabled = true;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -270,7 +294,6 @@ document.getElementById('cfgForm').addEventListener('submit', async (e) => {
   cfgDlg.hidden = true;
   await boot();  // connect after saving
 });
-
 btnSettings.addEventListener('click', () => { cfgDlg.hidden = false; });
 
 rateSlider.addEventListener('input', () => {
@@ -289,49 +312,90 @@ rateBox.addEventListener('change', () => {
   scheduleTick();
 });
 
-if (srvInp.value && pwInp.value) {
-  cfgDlg.hidden = true;
-  boot(); // autoconnect on revisit
+if (srvInp.value && pwInp.value) { cfgDlg.hidden = true; boot(); }
+
+////////////////////////////////////////////////////////////////////////////////
+// 3) DeviceOrientation → Quaternion (true orientation) + Three.js pose
+////////////////////////////////////////////////////////////////////////////////
+const rad = THREE.MathUtils.degToRad;
+const deg = THREE.MathUtils.radToDeg;
+const corrQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2);
+
+// Build corrected quaternion from (alpha, beta, gamma)
+function deviceToQuat(alpha, beta, gamma) {
+  // As per your reference: Euler(b, a, -g, "YXZ") then correct around X by -π/2
+  const e = new THREE.Euler(rad(beta), rad(alpha), -rad(gamma), 'YXZ');
+  const q = new THREE.Quaternion().setFromEuler(e);
+  q.multiply(corrQuat);
+  return q;
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// 3) live sensors (Yaw(α)→X, Pitch(β)→P, Roll(γ)→R with wrap)
-////////////////////////////////////////////////////////////////////////////////
+// Scene
+const poseCanvas = document.getElementById('poseCanvas');
+const renderer = new THREE.WebGLRenderer({ canvas: poseCanvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a0a);
+const cam = new THREE.PerspectiveCamera(55, 16/9, 0.1, 50);
+cam.position.set(0, 0.8, 2.2);
+scene.add(cam);
+
+const light = new THREE.HemisphereLight(0xffffff, 0x222222, 1.0);
+scene.add(light);
+const dir = new THREE.DirectionalLight(0xffffff, 0.3);
+dir.position.set(1,1,1);
+scene.add(dir);
+
+// Phone “slab”
+const phoneGeom = new THREE.BoxGeometry(0.7, 1.4, 0.05);
+const phoneMat  = new THREE.MeshStandardMaterial({ color: 0x2e6cff, metalness: 0.1, roughness: 0.9 });
+const phoneMesh = new THREE.Mesh(phoneGeom, phoneMat);
+scene.add(phoneMesh);
+
+// A ground grid for reference
+const grid = new THREE.GridHelper(10, 10, 0x333333, 0x222222);
+grid.position.y = -1;
+scene.add(grid);
+
+function resizePose() {
+  const rect = poseCanvas.parentElement.getBoundingClientRect();
+  const w = Math.max(300, rect.width);
+  const h = Math.max(220, rect.height - 24);
+  renderer.setSize(w, h, false);
+  cam.aspect = w / h;
+  cam.updateProjectionMatrix();
+}
+window.addEventListener('resize', resizePose);
+resizePose();
+
+function renderLoop() {
+  renderer.render(scene, cam);
+  requestAnimationFrame(renderLoop);
+}
+renderLoop();
+
 window.addEventListener('deviceorientation', e => {
-  if (e.alpha != null) {
-    // α = yaw (0..360), β = pitch (-180..180), γ = roll (-90..90)
-    yaw   = e.alpha;
-    pitch = e.beta;
-    roll  = e.gamma;
-    orientEl.textContent = `Yaw ${yaw.toFixed(0)}°  Pitch ${pitch.toFixed(0)}°  Roll ${roll.toFixed(0)}°`;
-  }
+  if (e.alpha == null) return;
+  yaw   = e.alpha;   // raw, only for display
+  pitch = e.beta;
+  roll  = e.gamma;
+
+  // true orientation from quaternion
+  curQuat.copy(deviceToQuat(yaw, pitch, roll));
+  phoneMesh.setRotationFromQuaternion(curQuat);
+
+  // update HUD with raw angles (just informational)
+  orientEl.textContent = `Yaw ${yaw.toFixed(0)}°  Pitch ${pitch.toFixed(0)}°  Roll ${roll.toFixed(0)}°`;
 }, true);
 
+// Acceleration for transient translation
 window.addEventListener('devicemotion', e => {
   let a = e.acceleration && (e.acceleration.x!=null) ? e.acceleration : e.accelerationIncludingGravity;
   if (a) accel = { x: a.x || 0, y: a.y || 0, z: a.z || 0 };
 }, true);
 
-btnCenter.addEventListener('click', () => {
-  baseYaw = yaw; basePitch = pitch; baseRoll = roll;
-});
-
-function getRelativeAngles() {
-  if (baseYaw==null || basePitch==null || baseRoll==null) return {X:0,P:0,R:0};
-  // wrap-around friendly deltas (360 ↔ 0 handled)
-  const dYaw   = wrap180(yaw   - baseYaw);
-  const dPitch = wrap180(pitch - basePitch);
-  const dRoll  = wrap180(roll  - baseRoll);
-
-  // map to command ranges (with your sign conventions):
-  // X: negative = look right, positive = look left
-  const X = clamp(-dYaw   * GAIN_YAW  , -400, 400);
-  // P: + up, - down
-  const P = clamp( dPitch * GAIN_PITCH, -400, 400);
-  // R: - right tilt, + left tilt
-  const R = clamp( dRoll  * GAIN_ROLL , -400, 400);
-  return {X,P,R};
-}
+btnCenter.addEventListener('click', () => { baseQuat = curQuat.clone(); });
 
 ////////////////////////////////////////////////////////////////////////////////
 // 4) HOME button: send and pause streaming for 5s
@@ -345,23 +409,38 @@ btnHome.addEventListener('click', () => {
 });
 
 ////////////////////////////////////////////////////////////////////////////////
-// 5) command synthesis & streaming (adjustable interval)
+// 5) Build command from RELATIVE quaternion yaw/pitch/roll + transients
 ////////////////////////////////////////////////////////////////////////////////
+function getRelativeYPRDeg() {
+  if (!baseQuat) return { yaw:0, pitch:0, roll:0 };
+  const invBase = baseQuat.clone().invert();
+  const rel = invBase.multiply(curQuat);                // q_rel = base^-1 * current
+  const e = new THREE.Euler().setFromQuaternion(rel, 'YXZ'); // yaw(Y), pitch(X), roll(Z)
+  return {
+    yaw:   deg(e.y),     // degrees
+    pitch: deg(e.x),
+    roll:  deg(e.z),
+  };
+}
+
 function decay(v){ return Math.abs(v) < 1 ? 0 : v*DECAY; }
 
 function tick() {
   if (!socket || socket.disconnected) return;
-  if (now() < pauseUntil) return; // paused after HOME
+  if (now() < pauseUntil) return;
 
-  // motion impulses → transient translations
-  //   forward/back  : accel.y -> Z (− forward, + backward)
-  //   up/down       : accel.z -> H (0..50)
-  //   left/right    : accel.x -> Y (− left, + right)
-  trans.Z = clamp(decay(trans.Z + (-accel.y*10)), -400, 400);
-  trans.H = clamp(decay(trans.H + ( accel.z* 2)),   0,  50);
-  trans.Y = clamp(decay(trans.Y + ( accel.x*10)), -400, 400);
+  // transient translations from accel
+  trans.Z = clamp(decay(trans.Z + (-accel.y*10)), -400, 400);  // forward/back
+  trans.H = clamp(decay(trans.H + ( accel.z* 2)),   0,  50);   // up/down
+  trans.Y = clamp(decay(trans.Y + ( accel.x*10)), -400, 400);  // left/right
 
-  const {X, P, R} = getRelativeAngles();
+  const { yaw: yDeg, pitch: pDeg, roll: rDeg } = getRelativeYPRDeg();
+
+  // Map to command ranges with your sign conventions:
+  // X: negative = look right, positive = look left
+  const X = clamp(-yDeg * GAIN_YAW,   -400, 400);
+  const P = clamp( pDeg * GAIN_PITCH, -400, 400);    // + up, − down
+  const R = clamp( rDeg * GAIN_ROLL,  -400, 400);    // − right tilt, + left tilt
 
   // apply sign flips
   const Xo = flips.X * X;
@@ -373,10 +452,8 @@ function tick() {
   const Po = flips.P * P;
   const Ro = flips.R * R;
 
-  const cmd = `X${Xo.toFixed(0)},Y${Yo.toFixed(0)},Z${Zo.toFixed(0)},` +
-              `H${Ho.toFixed(0)},S1,A1,R${Ro.toFixed(0)},P${Po.toFixed(0)}`;
+  const cmd = `X${Xo.toFixed(0)},Y${Yo.toFixed(0)},Z${Zo.toFixed(0)},H${Ho.toFixed(0)},S1,A1,R${Ro.toFixed(0)},P${Po.toFixed(0)}`;
   cmdEl.textContent = cmd;
-
   socket.emit('broadcast-message', { message: cmd });
 }
 
@@ -387,12 +464,22 @@ function scheduleTick() {
 scheduleTick();
 
 ////////////////////////////////////////////////////////////////////////////////
-// 6) frames: dynamic per-robot subscriptions
+// 6) Frames: respect aspect ratio based on actual frame sizes
 ////////////////////////////////////////////////////////////////////////////////
-function updateImg(imgEl, oldUrlRefName, payload, mime) {
+function updateImg(imgEl, wrapEl, oldUrlRefName, payload, mime) {
   const blob = payload instanceof Blob ? payload : new Blob([payload], { type: mime });
   const url = URL.createObjectURL(blob);
+  const tmp = new Image();
+  tmp.onload = () => {
+    // Update wrapper aspect ratio using real dimensions
+    wrapEl.style.aspectRatio = `${tmp.naturalWidth} / ${tmp.naturalHeight}`;
+    URL.revokeObjectURL(tmp.src);
+  };
+  tmp.src = url;
+
+  imgEl.onload = () => { /* nothing; image shows with object-fit: contain */ };
   imgEl.src = url;
+
   if (window[oldUrlRefName]) URL.revokeObjectURL(window[oldUrlRefName]);
   window[oldUrlRefName] = url;
 }
@@ -410,44 +497,39 @@ function subscribeDynamic(uuid) {
   unsubscribeDynamic();
   subscribedUuid = uuid;
   whichRobot.textContent = `robot: ${uuid}`;
-  socket.on(`/${uuid}_color`, (payload) => updateImg(imgColor, 'urlColor', payload, 'image/jpeg'));
-  socket.on(`/${uuid}_depth`, (payload) => updateImg(imgDepth, 'urlDepth', payload, 'image/png'));
+  socket.on(`/${uuid}_color`, (payload) => updateImg(imgColor, wrapColor, 'urlColor', payload, 'image/jpeg'));
+  socket.on(`/${uuid}_depth`, (payload) => updateImg(imgDepth, wrapDepth, 'urlDepth', payload, 'image/png'));
 }
 
-// Fallback legacy handlers if no target robot is known
+// Fallback legacy (if no uuid-specific streams)
 function wireLegacyHandlers(s) {
   s.off('frame-color'); s.off('frame-depth');
-  s.on('frame-color', (payload) => { if (!subscribedUuid) updateImg(imgColor, 'urlColor', payload, 'image/jpeg'); });
-  s.on('frame-depth', (payload) => { if (!subscribedUuid) updateImg(imgDepth, 'urlDepth', payload, 'image/png'); });
+  s.on('frame-color', (payload) => { if (!subscribedUuid) updateImg(imgColor, wrapColor, 'urlColor', payload, 'image/jpeg'); });
+  s.on('frame-depth', (payload) => { if (!subscribedUuid) updateImg(imgDepth, wrapDepth, 'urlDepth', payload, 'image/png'); });
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// 7) Presence & WS auth (JWT or ws+password)
+////////////////////////////////////////////////////////////////////////////////
 function chooseTargetFromList(list) {
-  // track sid→uuid map
   sidToUuid.clear();
   list.forEach(p => { if (p.id && p.uuid) sidToUuid.set(p.id, p.uuid); });
 
-  // keep target if still present
   if (targetUuid && [...sidToUuid.values()].includes(targetUuid)) {
     subscribeDynamic(targetUuid);
     return;
   }
-
-  // pick first other (not me)
   const candidates = list.filter(p => p.uuid && p.uuid !== myUuid);
   if (candidates.length > 0) {
     targetUuid = candidates[0].uuid;
     st.setItem('neck_target_uuid', targetUuid);
     subscribeDynamic(targetUuid);
   } else {
-    // nobody to subscribe — show legacy if agent broadcasts there
     whichRobot.textContent = 'robot: —';
     unsubscribeDynamic();
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// 7) networking: WS-only auth (JWT if present; else ws+password)
-////////////////////////////////////////////////////////////////////////////////
 function wirePresenceHandlers(s) {
   s.on('existing-peers', (arr) => chooseTargetFromList(arr || []));
   s.on('new-peer', (info) => {
@@ -480,27 +562,18 @@ function wireCommonHandlers(s) {
 
 function connectWS_withToken() {
   return new Promise((resolve,reject)=>{
-    const s = io(serverURL, {
-      path: SIO_PATH,
-      auth: { token: jwtToken },
-      transports: ['websocket']
-    });
+    const s = io(serverURL, { path: SIO_PATH, auth: { token: jwtToken }, transports: ['websocket'] });
     let settled = false;
     wireCommonHandlers(s);
     s.on('connect', () => { socket = s; setStatus('🟢'); settled = true; resolve('token'); });
     s.on('connect_error',(err) => { if (!settled) { s.close(); reject(err); } });
   });
 }
-
 function connectWS_withPassword() {
   return new Promise((resolve,reject)=>{
     const uuid = 'phone-' + Date.now().toString(36);
     myUuid = uuid; st.setItem('neck_my_uuid', myUuid);
-    const s = io(serverURL, {
-      path: SIO_PATH,
-      auth: { uuid, password: sharedPW },
-      transports: ['websocket']
-    });
+    const s = io(serverURL, { path: SIO_PATH, auth: { uuid, password: sharedPW }, transports: ['websocket'] });
     let settled = false;
     wireCommonHandlers(s);
     s.on('connect', () => { socket = s; setStatus('🟢'); settled = true; resolve('password'); });
@@ -516,24 +589,20 @@ async function boot() {
 
   setStatus('🟡');
 
-  // iOS sensors require HTTPS
   if (!window.isSecureContext && /iphone|ipad|ipod/i.test(navigator.userAgent)) {
     alert("iOS sensors require HTTPS. Open this page via https.");
   }
 
   try {
-    if (jwtToken) {
-      await connectWS_withToken();
-    } else {
-      await connectWS_withPassword();
-    }
+    if (jwtToken) { await connectWS_withToken(); }
+    else          { await connectWS_withPassword(); }
   } catch {
     try { await connectWS_withPassword(); }
     catch (ee) { console.error('WS connect failed:', ee); setStatus('🔴'); }
   }
 
-  // auto-calibrate once after 1s if not already done
-  setTimeout(() => { if (baseYaw==null) btnCenter.click(); }, 1000);
+  // auto-baseline once after 1s if not already
+  setTimeout(() => { if (!baseQuat) baseQuat = curQuat.clone(); }, 1000);
 }
 
 // auto-show settings on first load
