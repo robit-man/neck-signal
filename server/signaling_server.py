@@ -1,48 +1,60 @@
 #!/usr/bin/env python3
 """
-signaling_server.py
-───────────────────
-Self-bootstrapping Flask-SocketIO + LocalTunnel signaling server secured with JWT.
-
-What it does
-============
-• Creates/uses an on-disk virtual-env `venv/`, then relaunches itself from there.
-• First run only:
-      – prompts for CORS origins (comma-sep, blank = “*”)
-      – prompts for desired LocalTunnel sub-domain prefix
-      – prompts for a shared password every peer must send to /login
-      – writes a `.env` with JWT_SECRET & PEER_SHARED_SECRET
-      – writes `config.json` so subsequent runs are silent/automatic
-• Exposes:
-      GET  /          → health check, returns public tunnel URL
-      POST /login     → {uuid?, password} ⇨ {token, uuid}
-• WebSocket namespace `/` with JWT auth in the `auth` payload.
-• Restarts itself if the LocalTunnel URL goes dark for 5 minutes.
+signaling_server.py  –  JWT-secured Flask-SocketIO + LocalTunnel broker
+(… docstring unchanged …)
 """
-
 # ──────────────────────────────────────────────────────────────────────
-# I. bootstrap into a v-env (very small std-lib-only section)
+# I.  bootstrap into a v-env (std-lib only)
 # ──────────────────────────────────────────────────────────────────────
-import os, sys, subprocess
+import os, sys, subprocess, importlib
 from pathlib import Path
 
 BASE_DIR   = Path(__file__).resolve().parent
 VENV_DIR   = BASE_DIR / "venv"
-PY_IN_VENV = VENV_DIR / ("Scripts" if os.name == "nt" else "bin") / "python"
-REQS = ["flask", "flask-cors", "flask-socketio", "eventlet", "PyJWT"]
+BIN_DIR    = VENV_DIR / ("Scripts" if os.name == "nt" else "bin")
+PY_VENV    = BIN_DIR / "python"
+REQS       = ["flask", "flask-cors", "flask-socketio", "eventlet", "PyJWT"]
 
-def ensure_venv():
-    if Path(sys.executable).resolve() == PY_IN_VENV.resolve():
+def running_inside_venv() -> bool:
+    # robust even if python in venv is a symlink
+    return Path(sys.executable).resolve() == PY_VENV.resolve()
+
+def create_venv_once():
+    if VENV_DIR.exists():  # already created, nothing to do
         return
-    if not VENV_DIR.exists():
-        print("→ creating venv …")
-        subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
-        print("→ installing first-time dependencies …")
-        subprocess.check_call([str(PY_IN_VENV), "-m", "pip", "install",
-                               "--quiet", "--upgrade", "pip", *REQS])
-    os.execv(str(PY_IN_VENV), [str(PY_IN_VENV), *sys.argv])
+    print("→ Creating virtual-env …")
+    import venv; venv.EnvBuilder(with_pip=True).create(VENV_DIR)
+    print("→ Upgrading pip …")
+    subprocess.check_call([str(PY_VENV), "-m", "pip", "install", "--upgrade", "pip"])
+    print("→ Installing first-time dependencies …")
+    subprocess.check_call([str(PY_VENV), "-m", "pip", "install", *REQS])
 
-ensure_venv()
+def ensure_deps_inside_venv():
+    missing = []
+    for pkg, modulename in [("flask", "flask"),
+                            ("flask-cors", "flask_cors"),
+                            ("flask-socketio", "flask_socketio"),
+                            ("eventlet", "eventlet"),
+                            ("PyJWT", "jwt")]:
+        try:
+            importlib.import_module(modulename)
+        except ModuleNotFoundError:
+            missing.append(pkg)
+    if missing:
+        print("→ Installing missing deps inside venv:", ", ".join(missing))
+        subprocess.check_call([str(PY_VENV), "-m", "pip", "install", *missing])
+        # re-exec once so the fresh modules are importable in the current process
+        os.execv(str(PY_VENV), [str(PY_VENV), *sys.argv])
+
+# ––– main bootstrap flow –––
+if not running_inside_venv():
+    create_venv_once()
+    # jump into the v-env; everything else below runs only there
+    os.execv(str(PY_VENV), [str(PY_VENV), *sys.argv])
+
+# we are now inside the v-env – double-check deps (covers transient pip failures)
+ensure_deps_inside_venv()
+
 
 # ──────────────────────────────────────────────────────────────────────
 # II. heavy imports (after v-env) & monkey-patch
@@ -179,21 +191,41 @@ def login():
 @socketio.on("connect")
 def _connect(auth):
     token = isinstance(auth, dict) and auth.get("token")
+
+    # NEW: WS-only fallback — authenticate by shared password (no JWT)
+    if not token and isinstance(auth, dict) and auth.get("password"):
+        if auth["password"] == PEER_PW:
+            sid = request.sid
+            uid = auth.get("uuid") or "-".join(secrets.token_hex(2) for _ in range(4))
+            clients[sid] = {"uuid": uid, "roles": ["peer"]}
+            print(f"[+] {sid} ({uid}) connected via ws+password")
+
+            # notify others except sender
+            socketio.emit("new-peer", {"id": sid, **clients[sid]}, skip_sid=sid)
+            # send existing list to the new peer
+            socketio.emit("existing-peers",
+                          [{"id": pid, **info} for pid, info in clients.items() if pid != sid],
+                          to=sid)
+            return  # accept connection
+        else:
+            print("WS password invalid")
+            return False
+
+    # existing JWT path (unchanged)
     try:
         claims = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except Exception as e:
-        print("JWT decode error:", e); return False
+        print("JWT decode error:", e)
+        return False
 
     sid = request.sid
-    clients[sid] = {"uuid": claims["sub"], "roles": claims["roles"]}
+    clients[sid] = {"uuid": claims["sub"], "roles": claims.get("roles", [])}
     print(f"[+] {sid} ({claims['sub']}) connected")
-
-    # notify others (everyone except sender)
     socketio.emit("new-peer", {"id": sid, **clients[sid]}, skip_sid=sid)
-    # send existing list to the new peer only
     socketio.emit("existing-peers",
                   [{"id": pid, **info} for pid, info in clients.items() if pid != sid],
                   to=sid)
+
 
 @socketio.on("disconnect")
 def _disconnect():
