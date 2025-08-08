@@ -265,7 +265,7 @@ class CameraStreamer:
     def _loop(self):
         session = requests.Session()
         headers = {"Connection": "keep-alive"}
-        target_size = (640, 360)  # (W,H) normalized
+        target_size = (360, 640)  # (W,H) normalized
         while not self._stop.is_set():
             t0 = time.time()
             # fetch color
