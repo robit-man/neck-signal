@@ -175,10 +175,18 @@
       </form>
     </div>
   </div>
-
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.175.0/build/three.module.js"
+  }
+}
+</script>
 <!-- Main logic (module so we can import three.js) -->
 <script type="module">
-import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.175.0/build/three.module.js";
+import * as THREE from "three";
+import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.175.0/examples/jsm/controls/OrbitControls.js";
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // 0) Utility & globals
@@ -344,8 +352,15 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0a0a0a);
 const cam = new THREE.PerspectiveCamera(55, 16/9, 0.1, 50);
-cam.position.set(0, 0, 4.2);
+cam.position.set(0, 0, 5);
 scene.add(cam);
+
+// 👇 OrbitControls (just added)
+const controls = new OrbitControls(cam, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 0, 0);
+controls.update();
 
 const light = new THREE.HemisphereLight(0xffffff, 0x222222, 1.0);
 scene.add(light);
@@ -383,7 +398,7 @@ let posArr = null;
 let gridW = 0, gridH = 0;
 let srcW = 0, srcH = 0;
 const DIV = 3;          // downsample factor (higher = fewer verts)
-let depthScale = 0.28;  // world Z displacement at white
+let depthScale = 1.5;  // world Z displacement at white
 
 function ensureDepthGeometry(w, h) {
   // Rebuild once if no mesh or dims changed
@@ -408,12 +423,12 @@ function ensureDepthGeometry(w, h) {
 
   depthGeom = new THREE.PlaneGeometry(WORLD_W, WORLD_H, gridW - 1, gridH - 1);
 
-    // 🔻 flip V (y) in UVs so color isn’t upside-down
-    const uv = depthGeom.getAttribute('uv');
-    for (let i = 0; i < uv.count; i++) {
+  // 🔻 flip V (y) in UVs so color isn’t upside-down
+  const uv = depthGeom.getAttribute('uv');
+  for (let i = 0; i < uv.count; i++) {
     uv.setY(i, 1 - uv.getY(i));
-    }
-    uv.needsUpdate = true;
+  }
+  uv.needsUpdate = true;
 
   posAttr = depthGeom.getAttribute('position');
   posArr  = posAttr.array;
@@ -435,6 +450,7 @@ window.addEventListener('resize', resizePose);
 resizePose();
 
 function renderLoop() {
+  controls.update(); // 👈 keep OrbitControls smooth
   renderer.render(scene, cam);
   requestAnimationFrame(renderLoop);
 }
@@ -721,5 +737,6 @@ async function boot() {
 if (!(st.getItem('neck_server') && st.getItem('neck_pw'))) cfgDlg.hidden = false;
 else boot();
 </script>
+
 </body>
 </html>
