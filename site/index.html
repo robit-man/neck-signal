@@ -512,7 +512,7 @@ function tick() {
 
   // transient translations from accel
   trans.Z = clamp(decay(trans.Z + (-accel.y*10)), -400, 400);  // forward/back
-  trans.H = clamp(decay(trans.H + ( accel.z* 2)),   0,  50);   // up/down
+  trans.H = clamp(decay(trans.H + ( accel.z* 2)),   20,  50);   // up/down
   trans.Y = clamp(decay(trans.Y + ( accel.x*10)), -400, 400);  // left/right
 
   const { yaw: yDeg, pitch: pDeg, roll: rDeg } = getRelativeYPRDeg();
