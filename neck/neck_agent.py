@@ -2,26 +2,18 @@
 """
 neck_agent.py  –  JWT-secured Socket.IO ⇄ Serial bridge + camera streamer
 
-• boots / re-uses  ag_venv/  (installs pyserial, requests, python-socketio, pillow)
-• remembers  server-URL  &  UUID  in  config.json
-• first run asks for the shared password (.env → PEER_SHARED_SECRET)
-• on serial-connect:
-      – prints an example of a *full* command
-      – sends HOME once
-• every incoming command from the UI:
-      – "home"  →  literal HOME
-      – partial  →  merged into full X,Y,Z,H,S,A,R,P and validated
-• camera streamer:
-      – polls  http://127.0.0.1:8080/camera/rs_color  (default)  →  downscale+crop to 640×360 → JPEG
-      – polls  http://127.0.0.1:8080/camera/rs_depth  (default)  →  forward binary PNG (or fix to 640×360)
-      – emits Socket.IO binary events:  "frame-color"  and  "frame-depth"
+Changes in this version:
+• Emits frames ONLY via Socket.IO events ("frame-color", "frame-depth") with bytes payloads.
+• Color+Depth captured in the same cycle to keep them temporally aligned (shared seq + timestamp).
+• Robust reconnect: on disconnect OR expired token, re-login and reconnect automatically.
+• Threads are lifecycle-managed; streaming pauses while disconnected and resumes after reconnect.
 """
 
 ###############################################################################
 # 0.  ▸▸▸  very light v-env bootstrap  ▸▸▸
 ###############################################################################
 from __future__ import annotations
-import os, sys, subprocess, venv, json, secrets, argparse, time, platform, pathlib, io, threading
+import os, sys, subprocess, venv, json, secrets, argparse, time, platform, pathlib, io, threading, re
 from typing import Optional, Tuple
 from urllib.parse import urljoin
 
@@ -31,7 +23,7 @@ VENV_PY   = VENV_DIR / ("Scripts" if platform.system() == "Windows" else "bin") 
 DEPS      = ["pyserial", "python-socketio[client]", "requests", "pillow"]
 
 def in_venv() -> bool:
-    return sys.prefix != sys.base_prefix               # reliable for Py ≥3.4
+    return sys.prefix != sys.base_prefix
 
 if not in_venv():
     if not VENV_DIR.exists():
@@ -41,7 +33,7 @@ if not in_venv():
                                "--quiet", "--upgrade", "pip", *DEPS])
     os.execv(str(VENV_PY), [str(VENV_PY), *sys.argv])
 
-# inside the venv: make sure *all* deps are present (add later if user deletes)
+# ensure deps if user nuked them later
 missing: list[str] = []
 for pkg, mod in [("pyserial", "serial"),
                  ("requests", "requests"),
@@ -51,9 +43,8 @@ for pkg, mod in [("pyserial", "serial"),
     except ModuleNotFoundError: missing.append(pkg)
 if missing:
     print("[agent] installing extra deps:", ", ".join(missing))
-    subprocess.check_call([sys.executable, "-m", "pip", "install",
-                           "--quiet", *missing])
-    os.execv(sys.executable, [sys.executable, *sys.argv])     # restart once
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *missing])
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 ###############################################################################
 # 1.  .env  and  config.json
@@ -73,14 +64,14 @@ for ln in ENV_PATH.read_text().splitlines():
         k,v = ln.split("=",1); os.environ.setdefault(k.strip(), v.strip())
 PEER_SECRET = os.environ["PEER_SHARED_SECRET"]
 
-# defaults (created into config.json if missing)
+# defaults
 default_cfg = {
     "server_url": "",
     "uuid": "",
     # camera streamer knobs:
     "camera_host": "http://127.0.0.1:8080",
-    "color_path": "/camera/rs_color",   # expected 1280x800 JPEG/PNG (we crop/resize to 640x360)
-    "depth_path": "/camera/rs_depth",   # expected 640x360 PNG (forward as-is)
+    "color_path": "/camera/rs_color",   # we normalize to 640x360 JPEG
+    "depth_path": "/camera/rs_depth",   # we normalize to 640x360 PNG (8-bit)
     "frame_hz": 12                      # ~12 FPS by default
 }
 cfg: dict = json.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
@@ -120,21 +111,22 @@ import requests, socketio, serial        # type: ignore
 from PIL import Image
 
 ###############################################################################
-# 3.  JWT login loop
+# 3.  JWT login helper
 ###############################################################################
 LOGIN_URL = urljoin(SERVER + "/", "login")
+
 def try_login() -> Optional[str]:
     try:
-        r = requests.post(LOGIN_URL, json={"uuid":UUID, "password":PEER_SECRET}, timeout=4)
-        if r.status_code == 200 and "token" in r.json(): return r.json()["token"]
-        print("[agent] /login →", r.status_code)
-    except Exception as e: print("[agent] /login unreachable:", e)
+        r = requests.post(LOGIN_URL, json={"uuid":UUID, "password":PEER_SECRET}, timeout=5)
+        if r.status_code == 200:
+            j = r.json()
+            tok = j.get("token")
+            if tok:
+                return tok
+        print("[agent] /login →", r.status_code, getattr(r, "text", ""))
+    except Exception as e:
+        print("[agent] /login unreachable:", e)
     return None
-
-token = None
-while token is None:
-    token = try_login() or (time.sleep(3) or None)
-print("[agent] JWT ✓")
 
 ###############################################################################
 # 4.  serial connect (+ HOME once, example)
@@ -152,7 +144,6 @@ while ser is None:
     if ser is None:
         print("[agent] no serial – retry in 3 s"); time.sleep(3)
 
-# ▸▸ internal state / helpers  ──────────────────────────────────────────────
 ALLOWED = {
     "X": (-700, 700, int), "Y": (-700, 700, int), "Z": (-700, 700, int),
     "H": (0, 70, int),     "S": (0, 10, float),   "A": (0, 10, float),
@@ -164,7 +155,7 @@ def validate(cmd:str)->bool:
     if cmd.lower()=="home": return True
     seen=set()
     for tok in cmd.split(","):
-        m = __import__("re").match(r"^([XYZHSARP])(-?\d+(?:\.\d+)?)$", tok.strip())
+        m = re.match(r"^([XYZHSARP])(-?\d+(?:\.\d+)?)$", tok.strip())
         if not m or m.group(1) in seen: return False
         k,val = m.group(1), m.group(2); low,high,cast = ALLOWED[k]
         try: v=cast(val)
@@ -178,24 +169,23 @@ def merge(cmd:str)->str:
         for k in state: state[k]=1.0 if k in ("S","A") else 0
         return "HOME"
     for tok in cmd.split(","):
-        m = __import__("re").match(r"^([XYZHSARP])(-?\d+(?:\.\d+)?)$", tok.strip())
+        m = re.match(r"^([XYZHSARP])(-?\d+(?:\.\d+)?)$", tok.strip())
         if m:
             k,val=m.group(1),m.group(2); state[k]=ALLOWED[k][2](val)
     return ",".join(f"{k}{state[k]}" for k in ["X","Y","Z","H","S","A","R","P"])
 
-# example + home
 print("[agent] example full cmd:  X100,Y-50,Z0,H30,S1,A1,R0,P0")
 ser.write(b"HOME\n"); print("[agent] → serial  HOME")
 
 ###############################################################################
-# 5.  Socket.IO bridge (peer-message → serial)  + camera streaming
+# 5.  Socket.IO client + camera streaming (aligned)
 ###############################################################################
-sio = socketio.Client(reconnection=True, reconnection_attempts=0)
+# We manage reconnect ourselves so we can refresh JWTs.
+sio = socketio.Client(reconnection=False, logger=False, engineio_logger=False)
 
-@sio.event
-def connect():    print("[agent] WS connected")
-@sio.event
-def disconnect(): print("[agent] WS disconnected")
+_ws_stop = threading.Event()
+_stream_stop = threading.Event()
+_connected_lock = threading.Lock()
 
 def handle_cmd(raw:str):
     if not validate(raw):
@@ -204,21 +194,36 @@ def handle_cmd(raw:str):
     try:
         ser.write((full+"\n").encode())
         print(f"[agent] → serial  {full}")
-        sio.emit("neck_ack", {"command":full})
+        if sio.connected:
+            sio.emit("neck_ack", {"command":full})
     except Exception as e:
         print("[agent] serial error:", e)
 
-@sio.on("peer-message")          # relayed from UI
+@sio.on("peer-message")
 def _msg(d): handle_cmd(str(d.get("message","")).strip())
 
-@sio.on("neck_command")          # optional direct event
+@sio.on("neck_command")
 def _cmd(d): handle_cmd(str(d.get("command","")).strip())
 
-# ────────────────────────────────────────────────────────────────────
-# 5.b  Camera streaming worker
-# ────────────────────────────────────────────────────────────────────
+@sio.event
+def connect():
+    print("[agent] WS connected")
+    with _connected_lock:
+        _stream_stop.clear()  # let stream run
+
+@sio.event
+def disconnect():
+    print("[agent] WS disconnected")
+    with _connected_lock:
+        _stream_stop.set()    # pause streaming emits (fetch continues but no emits)
+
+@sio.event
+def connect_error(data):
+    # will be handled by our ws loop (we'll re-login and retry)
+    print("[agent] connect_error:", data)
+
+# ---- Camera helpers ---------------------------------------------------
 def crop_to_aspect(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    """Center-crop PIL image to target aspect before resize."""
     tw, th = target_w, target_h
     W, H = img.size
     target_ratio = tw / th
@@ -226,17 +231,16 @@ def crop_to_aspect(img: Image.Image, target_w: int, target_h: int) -> Image.Imag
     if abs(src_ratio - target_ratio) < 1e-3:
         return img
     if src_ratio > target_ratio:
-        # too wide → crop width
         new_w = int(H * target_ratio)
         left = (W - new_w) // 2
         return img.crop((left, 0, left + new_w, H))
     else:
-        # too tall → crop height
         new_h = int(W / target_ratio)
         top = (H - new_h) // 2
         return img.crop((0, top, W, top + new_h))
 
 class CameraStreamer:
+    """Single-cycle alignment: fetch color then depth within the same period."""
     def __init__(self, sio_client: socketio.Client, cfg: dict):
         self.sio = sio_client
         self.host = cfg["camera_host"].rstrip("/")
@@ -245,107 +249,143 @@ class CameraStreamer:
         self.hz = max(1, min(60, int(cfg.get("frame_hz", 12))))
         self.period = 1.0 / self.hz
         self._stop = threading.Event()
-        self._t_color = None
-        self._t_depth = None
+        self._t = None
+        self.seq = 0
 
     def start(self):
+        if self._t and self._t.is_alive(): return
         self._stop.clear()
-        self._t_color = threading.Thread(target=self._loop_color, daemon=True)
-        self._t_depth = threading.Thread(target=self._loop_depth, daemon=True)
-        self._t_color.start()
-        self._t_depth.start()
-        print(f"[agent] camera streaming started @ {self.hz} FPS")
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+        print(f"[agent] camera streaming loop @ {self.hz} FPS")
 
     def stop(self):
         self._stop.set()
 
-    def _loop_color(self):
+    def _loop(self):
         session = requests.Session()
-        target_size = (360, 640)
+        headers = {"Connection": "keep-alive"}
+        target_size = (640, 360)  # (W,H) normalized
         while not self._stop.is_set():
             t0 = time.time()
+            # fetch color
+            color_bytes = None
+            depth_bytes = None
+            t_color = t_depth = None
+
             try:
-                r = session.get(self.color_url, timeout=1.5)
+                r = session.get(self.color_url, timeout=1.5, headers=headers)
                 if r.status_code == 200 and r.content:
-                    # open with PIL
                     with Image.open(io.BytesIO(r.content)) as im:
                         im = im.convert("RGB")
                         im = crop_to_aspect(im, *target_size)
                         im = im.resize(target_size, Image.BICUBIC)
-                        # JPEG encode
                         buf = io.BytesIO()
                         im.save(buf, format="JPEG", quality=70, optimize=True)
-                        data = buf.getvalue()
-                        # emit as binary
-                        if self.sio.connected:
-                            self.sio.emit("frame-color", data)
-                # else: ignore quietly to keep loop real-time
-            except Exception as e:
-                # keep running; transient failures are OK
-                # print(f"[agent] color fetch error: {e}")
+                        color_bytes = buf.getvalue()
+                        t_color = time.monotonic()
+            except Exception:
                 pass
-            # frame pacing
-            dt = time.time() - t0
-            if dt < self.period:
-                time.sleep(self.period - dt)
 
-    def _loop_depth(self):
-        session = requests.Session()
-        target_size = (360, 640)
-        while not self._stop.is_set():
-            t0 = time.time()
+            # fetch depth immediately after color (temporal pairing)
             try:
-                r = session.get(self.depth_url, timeout=1.5)
+                r = session.get(self.depth_url, timeout=1.5, headers=headers)
                 if r.status_code == 200 and r.content:
                     payload = r.content
-                    # If the depth image is already 640x360 PNG, forward raw.
-                    # Otherwise, attempt to normalize to 640x360 8-bit PNG.
-                    do_forward = True
                     try:
                         with Image.open(io.BytesIO(payload)) as im:
                             W,H = im.size
                             if (W,H) != target_size:
-                                do_forward = False
                                 im = im.convert("L").resize(target_size, Image.NEAREST)
                                 buf = io.BytesIO()
                                 im.save(buf, format="PNG", optimize=True)
                                 payload = buf.getvalue()
+                        depth_bytes = payload
+                        t_depth = time.monotonic()
                     except Exception:
-                        # if not an image, just forward raw
-                        pass
-
-                    if self.sio.connected:
-                        self.sio.emit("frame-depth", payload)
-            except Exception as e:
-                # print(f"[agent] depth fetch error: {e}")
+                        # not an image? still treat as payload
+                        depth_bytes = payload
+                        t_depth = time.monotonic()
+            except Exception:
                 pass
+
+            # Emit only when connected; keep color→depth order and minimal skew
+            if self.sio.connected and not _stream_stop.is_set():
+                seq = self.seq = (self.seq + 1) & 0x7fffffff
+                # Optional: warn if skew is high
+                if t_color and t_depth and abs(t_color - t_depth) > 0.06:
+                    # just a note; no structural changes to payload
+                    print(f"[agent] warn: color/depth skew {abs(t_color - t_depth)*1000:.0f} ms")
+
+                if color_bytes is not None:
+                    self.sio.emit("frame-color", color_bytes)
+                if depth_bytes is not None:
+                    self.sio.emit("frame-depth", depth_bytes)
+
+            # frame pacing
             dt = time.time() - t0
             if dt < self.period:
                 time.sleep(self.period - dt)
 
 camera_streamer = CameraStreamer(sio, cfg)
 
-# connect with JWT, then start streaming
-while True:
-    try:
-        sio.connect(SERVER, auth={"token":token})
-        break
-    except Exception as e:
-        print("[agent] WS connect error:", e); time.sleep(3)
+###############################################################################
+# 6.  WS connect/reconnect loop (refresh JWT on demand)
+###############################################################################
+def ws_loop():
+    """Runs forever. If disconnected or token expires, re-login and reconnect."""
+    cur_token = None
+    backoff = 1.0
+    while not _ws_stop.is_set():
+        if not sio.connected:
+            # (re)login
+            tok = try_login()
+            if not tok:
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 8.0)
+                continue
+            cur_token = tok
+            backoff = 1.0
+            # connect (websocket transport to avoid any polling oddities)
+            try:
+                sio.connect(
+                    SERVER,
+                    auth={"token": cur_token},
+                    transports=["websocket"],
+                    socketio_path="/socket.io",
+                    wait_timeout=6,
+                )
+                # start/ensure streaming
+                camera_streamer.start()
+            except Exception as e:
+                print("[agent] WS connect error:", e)
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 8.0)
+                continue
+        # when connected, sleep a bit and re-check
+        time.sleep(1.0)
 
-# start camera streaming once connected
-camera_streamer.start()
-
+###############################################################################
+# 7.  Main
+###############################################################################
 print("[agent] bridge live – Ctrl-C to quit")
+t_ws = threading.Thread(target=ws_loop, daemon=True)
+t_ws.start()
+
 try:
-    while True: time.sleep(1)
+    while True:
+        time.sleep(1)
 except KeyboardInterrupt:
     pass
 finally:
+    try: _ws_stop.set()
+    except: ...
     try: camera_streamer.stop()
     except: ...
     try: ser.close()
     except: ...
-    try: sio.disconnect()
+    try:
+        if sio.connected:
+            sio.disconnect()
     except: ...
     print("[agent] bye")

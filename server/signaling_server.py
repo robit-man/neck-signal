@@ -9,8 +9,9 @@ Clients that want a specific robot’s stream should listen to those dynamic eve
 # ──────────────────────────────────────────────────────────────────────
 # I.  bootstrap into a v-env (std-lib only)
 # ──────────────────────────────────────────────────────────────────────
-import os, sys, subprocess, importlib
+import os, sys, subprocess
 from pathlib import Path
+import importlib.util as _ilu
 
 BASE_DIR   = Path(__file__).resolve().parent
 VENV_DIR   = BASE_DIR / "venv"
@@ -31,16 +32,20 @@ def create_venv_once():
     print("→ Installing first-time dependencies …")
     subprocess.check_call([str(PY_VENV), "-m", "pip", "install", *REQS])
 
+def _module_missing(modname: str) -> bool:
+    # Use spec lookup only — do NOT import third-party modules here.
+    return _ilu.find_spec(modname) is None
+
 def ensure_deps_inside_venv():
     missing = []
-    for pkg, modulename in [("flask", "flask"),
-                            ("flask-cors", "flask_cors"),
-                            ("flask-socketio", "flask_socketio"),
-                            ("eventlet", "eventlet"),
-                            ("PyJWT", "jwt")]:
-        try:
-            importlib.import_module(modulename)
-        except ModuleNotFoundError:
+    # map: pip-name -> import-name
+    checks = [("flask", "flask"),
+              ("flask-cors", "flask_cors"),
+              ("flask-socketio", "flask_socketio"),
+              ("eventlet", "eventlet"),
+              ("PyJWT", "jwt")]
+    for pkg, mod in checks:
+        if _module_missing(mod):
             missing.append(pkg)
     if missing:
         print("→ Installing missing deps inside venv:", ", ".join(missing))
@@ -54,14 +59,16 @@ if not running_inside_venv():
 ensure_deps_inside_venv()
 
 # ──────────────────────────────────────────────────────────────────────
-# II. heavy imports (after v-env) & monkey-patch
+# II. heavy imports (after v-env) & monkey-patch — FIRST THING
+#     (nothing from Flask/Werkzeug imported before this line)
 # ──────────────────────────────────────────────────────────────────────
 import eventlet; eventlet.monkey_patch()
 
+# Safe to import everything else now
 import json, re, select, fcntl, shutil, time, threading, secrets, argparse
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
-import urllib.request, subprocess
+import urllib.request
 
 import jwt
 from flask import Flask, request, jsonify
@@ -158,7 +165,7 @@ ALLOWED = "*" if cors_raw == ["*"] else \
 print("→ Allowed CORS origins:", ALLOWED)
 
 # ──────────────────────────────────────────────────────────────────────
-# VI.  Flask + Socket.IO (JWT guard)  ──────────
+# VI.  Flask + Socket.IO (JWT guard)
 # ──────────────────────────────────────────────────────────────────────
 app      = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": ALLOWED}})
@@ -240,11 +247,6 @@ def _broadcast(data):
 
 # ──────────────────────────────────────────────────────────────────────
 # NEW: Per-peer dynamic frame endpoints
-#   Agent → emits to "frame-color"/"frame-depth" (binary bytes)
-#   Server → re-emits to *both* legacy and dynamic:
-#            "frame-color"/"frame-depth" (legacy)
-#            "/<uuid>_color" and "/<uuid>_depth" (dynamic, binary)
-# Clients interested in a specific robot listen to those dynamic names.
 # ──────────────────────────────────────────────────────────────────────
 def _uuid_for_sid(sid: str) -> str | None:
     info = clients.get(sid)
@@ -255,18 +257,16 @@ def _relay_color(data):
     sid = request.sid
     uid = _uuid_for_sid(sid)
     if not uid: return
-    # Legacy broadcast (all except sender)
-    socketio.emit("frame-color", data, skip_sid=sid)
-    # Dynamic, per-robot channel
-    socketio.emit(f"/{uid}_color", data, skip_sid=sid)
+    socketio.emit("frame-color", data, skip_sid=sid)         # legacy
+    socketio.emit(f"/{uid}_color", data, skip_sid=sid)       # dynamic
 
 @socketio.on("frame-depth")
 def _relay_depth(data):
     sid = request.sid
     uid = _uuid_for_sid(sid)
     if not uid: return
-    socketio.emit("frame-depth", data, skip_sid=sid)
-    socketio.emit(f"/{uid}_depth", data, skip_sid=sid)
+    socketio.emit("frame-depth", data, skip_sid=sid)         # legacy
+    socketio.emit(f"/{uid}_depth", data, skip_sid=sid)       # dynamic
 
 # ──────────────────────────────────────────────────────────────────────
 # VII. heartbeat – restart if tunnel lost
@@ -287,7 +287,7 @@ def heartbeat():
         if misses >= 5:
             print("‼️ tunnel lost – restarting …")
             os.execv(sys.executable, [sys.executable, *sys.argv])
-        time.sleep(60)
+        time.sleep(5)
 
 # ──────────────────────────────────────────────────────────────────────
 # VIII. run
