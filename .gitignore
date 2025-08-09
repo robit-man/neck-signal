@@ -2,3 +2,5 @@
 */*.json
 */.env
 */*.pem
+*/*-node
+*/*-bridge
