@@ -17,12 +17,34 @@
     *{box-sizing:border-box; -webkit-tap-highlight-color: transparent;}
     html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;}
     a{color:inherit}
-    header.app{position:sticky; top:0; z-index:2; padding:12px max(12px, env(safe-area-inset-left)) 12px max(12px, env(safe-area-inset-right));
-      background:var(--panel); border-bottom:1px solid #0e141c; display:flex; gap:8px; align-items:center;}
-    header.app h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.3px}
-    .chip{padding:6px 10px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:12px;white-space:nowrap}
+  .qrwrap canvas, .qrwrap img {
+    image-rendering: pixelated;
+    width: auto !important;
+    height: auto !important;
+    max-width: 100%;
+    display: block;
+  }
+
+  /* Header chips scroll horizontally on overflow (mobile) */
+  header.app .chiprow{
+    display:flex; gap:8px; flex:1 1 auto; min-width:0;
+    overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap; padding:0 4px;
+  }
+    header.app{
+      position:sticky; top:0; z-index:2;
+      padding:12px max(12px, env(safe-area-inset-left)) 12px max(12px, env(safe-area-inset-right));
+      background:var(--panel); border-bottom:1px solid #0e141c; display:flex; gap:8px; align-items:center;
+    }
+    header.app h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.3px;flex:0 0 auto}
+    .chiprow{
+      display:flex; gap:8px; flex:1 1 auto; min-width:0;
+      overflow-x:auto; -webkit-overflow-scrolling: touch; scrollbar-width: thin; white-space:nowrap; padding:0 4px;
+    }
+    .chip{padding:6px 10px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:12px;white-space:nowrap;flex:0 0 auto}
+    .actions{flex:0 0 auto; display:flex; gap:8px}
     .btn{appearance:none;border:1px solid #1f2a3a;background:var(--panel2);color:var(--fg);padding:10px 14px;border-radius:10px;font-weight:600}
     .btn:active{transform:scale(.98)} .btn.wide{width:100%}
+
     main{display:flex; flex-direction:column; gap:12px; padding:12px max(12px, env(safe-area-inset-left)) 24px max(12px, env(safe-area-inset-right));}
     section.card{border:1px solid #0e141c; border-radius:var(--radius); background:var(--panel); overflow:hidden; display:flex; flex-direction:column;}
     section.card > .title{padding:12px; background:var(--panel2); border-bottom:1px solid #0e141c; display:flex; align-items:center; justify-content:space-between; gap:8px; font-weight:700;}
@@ -37,27 +59,36 @@
     .list{display:flex;flex-direction:column;gap:10px}
     .cardline{border:1px solid #1b2533; border-radius:12px; padding:10px 12px; background:#0f1520; display:flex; gap:10px; justify-content:space-between; align-items:center}
     .copybtn{border:1px solid #263249;background:#182238;color:var(--fg);padding:8px 10px;border-radius:8px}
+
     .modal{position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:10; background:rgba(0,0,0,.6)}
     .modal .box{width:min(520px, 94vw); background:var(--panel); border:1px solid #1b2533; border-radius:16px; overflow:hidden}
     .modal .box .head{display:flex;justify-content:space-between;align-items:center;padding:12px;background:var(--panel2);border-bottom:1px solid #0e141c}
     .modal .box .body{padding:12px}
     .qrwrap{display:flex;align-items:center;justify-content:center;padding:8px}
     .qrwrap > div{width:min(80vw, 360px); height:min(80vw, 360px); background:#fff; padding:12px; border-radius:12px}
+
     .toast{position:fixed; left:50%; transform:translateX(-50%); bottom:calc(16px + env(safe-area-inset-bottom)); background:#0f1520; border:1px solid #1f2a3a; padding:10px 14px; border-radius:12px; display:none}
-    .live-wrap{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+
+    .live-wrap{display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap}
     .live-panel{display:flex; flex-direction:column; gap:8px}
-    .canvasbox{background:#000; border:1px solid #1b2533; border-radius:12px; overflow:hidden; width:min(640px, 100%); }
+    .canvasbox{background:#000; border:1px solid #1b2533; border-radius:12px; overflow:hidden; max-width:640px; width:100%}
     .canvasbox canvas{display:block; width:100%; height:auto}
-    @media (min-width: 920px){ main{display:grid; grid-template-columns: 1.35fr .65fr; align-items:start} .kv{grid-template-columns:160px 1fr} }
+
+    @media (min-width: 920px){
+      main{display:grid; grid-template-columns: 1fr; align-items:start}
+      .kv{grid-template-columns:350px 2fr}
+    }
   </style>
 </head>
 <body>
   <header class="app">
     <h1>NKN Client</h1>
-    <span class="chip" id="chipAddr">addr: —</span>
-    <span class="chip" id="chipReady">status: idle</span>
-    <span class="chip" id="chipSubs">subclients: —</span>
-    <div style="margin-left:auto; display:flex; gap:8px;">
+    <div class="chiprow" id="chipRow">
+      <span class="chip" id="chipAddr">addr: —</span>
+      <span class="chip" id="chipReady">status: idle</span>
+      <span class="chip" id="chipSubs">subclients: —</span>
+    </div>
+    <div class="actions">
       <button class="btn" id="btnShowQR" aria-label="Show Invite QR">Invite</button>
       <button class="btn" id="btnSettings" aria-label="Open Settings">Settings</button>
     </div>
@@ -85,18 +116,26 @@
       </div>
       <div class="content">
         <div class="live-wrap">
-          <div class="live-panel">
+          <div class="live-panel" style="flex:1 1 360px; min-width:280px;">
             <div class="canvasbox"><canvas id="liveCanvas" width="640" height="360" aria-label="Live frame"></canvas></div>
             <div class="small">fps: <span id="liveFps">0.0</span> • last: <span id="liveMeta">—</span></div>
           </div>
-          <div class="live-panel" style="min-width:240px; flex:1 1 260px;">
+
+          <div class="live-panel" style="min-width:260px; flex:1 1 300px;">
             <div><b>Resolution</b> (<span id="resVal">60</span>%)</div>
             <input id="resSlider" type="range" min="20" max="100" step="5" value="60" />
             <div class="small">Sends <code>/res N%</code> to the selected device.</div>
-            <div style="display:flex; gap:8px; margin-top:8px;">
-              <button class="btn" id="btnPing">Ping</button>
-              <button class="btn" id="btnStats">Stats</button>
+
+            <div class="row" style="margin-top:10px;">
+              <input id="cmdText" type="text" placeholder="Command e.g. X100,Y-50 or /home or /stats on" />
+              <button class="btn" id="btnSendCmd">Send</button>
             </div>
+
+            <div style="display:flex; gap:8px; margin-top:8px;">
+              <button class="btn" id="btnStatsOnce">Stats once</button>
+              <button class="btn" id="btnStatsToggle">Stats on/off</button>
+            </div>
+
             <div class="small mono" id="cmdAck" style="margin-top:8px; max-width:48ch; word-break:break-word;"></div>
           </div>
         </div>
@@ -225,16 +264,17 @@
       };
     }
 
-    // Inbound: grant → address book; frames → live canvas; cmd-ack → status line
+    // Inbound: grant → address book; frames → live canvas; ack/stats → status line
     const canvas = $('#liveCanvas');
     const ctx = canvas.getContext('2d');
     let lastDraw = performance.now(), drawCount = 0, fps = 0.0;
+
     function drawFrameFromBase64(b64){
       const img = new Image();
       img.onload = () => {
-        // Resize canvas to incoming aspect (max width ~ canvas CSS width)
-        const maxCssW = canvas.clientWidth || 640;
-        const scale = Math.min(1, maxCssW / img.width);
+        // Fit to container width
+        const cssW = canvas.parentElement.clientWidth || 640;
+        const scale = Math.min(1, cssW / img.width);
         const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
         canvas.width = w; canvas.height = h;
         ctx.drawImage(img, 0, 0, w, h);
@@ -253,8 +293,13 @@
       } else if (body.event === 'frame-color' && body.data){
         $('#liveMeta').textContent = `from ${src}`;
         drawFrameFromBase64(body.data);
-      } else if (body.event === 'cmd-ack'){
-        $('#cmdAck').textContent = (body.ok ? '✓ ' : '✗ ') + (body.msg || '');
+      } else if (body.event === 'ack' || body.event === 'cmd-ack'){
+        const ok = body.ok ? '✓' : '✗';
+        const msg = body.note || body.msg || '';
+        $('#cmdAck').textContent = `${ok} ${msg}`;
+      } else if (body.event === 'stats'){
+        const s = body;
+        $('#cmdAck').textContent = `fps_out=${s.fps_out} size=${s.jpeg_bytes} w=${s.w} h=${s.h}`;
       }
     }
 
@@ -347,20 +392,30 @@
       startClient(seedHex);
     }
 
-    // Command sending (slider)
+    // Command sending
     const sendResDebounced = debounce((pct)=>{
       if (!state.targetDevice){ toast('No device selected'); return; }
       const cmd = `/res ${pct}%`;
-      state.dm(state.targetDevice, {type:'cmd', cmd}).then(()=> { $('#cmdAck').textContent = '…sent /res'; });
+      state.dm(state.targetDevice, {event:'cmd', cmd}).then(()=> { $('#cmdAck').textContent = '…sent /res'; });
     }, 250);
+
+    const sendCmd = ()=>{
+      if (!state.targetDevice){ toast('No device selected'); return; }
+      const raw = ($('#cmdText').value || '').trim();
+      if (!raw){ toast('Enter a command'); return; }
+      state.dm(state.targetDevice, {event:'cmd', cmd: raw}).then(()=> { $('#cmdAck').textContent = '…sent'; });
+    };
 
     $('#selDevice').addEventListener('change', (e)=>{ state.targetDevice = e.target.value || ''; });
     $('#resSlider').addEventListener('input', (e)=>{
       const v = parseInt(e.target.value,10); $('#resVal').textContent = v;
       sendResDebounced(v);
     });
-    $('#btnPing').onclick = ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {type:'cmd', cmd:'/ping'}); };
-    $('#btnStats').onclick= ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {type:'cmd', cmd:'/stats'}); };
+    $('#btnSendCmd').onclick = sendCmd;
+    $('#cmdText').addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); sendCmd(); } });
+
+    $('#btnStatsOnce').onclick = ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {event:'cmd', cmd:'/stats once'}); };
+    $('#btnStatsToggle').onclick= ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {event:'cmd', cmd:'/stats'}); };
 
     // Events
     $('#btnSettings').onclick = () => document.querySelector('#secSettings').scrollIntoView({behavior:'smooth'});
@@ -371,6 +426,14 @@
     $('#btnClearBook').onclick = () => { if (confirm('Clear all grants?')) { BOOK.clear(); renderDeviceSelect(); } };
 
     // Boot
+    function onResize(){ // keep canvas fitting container on rotate
+      const w = canvas.parentElement.clientWidth || 640;
+      const h = Math.round(w * (9/16));
+      canvas.width = w; canvas.height = h;
+    }
+    window.addEventListener('resize', onResize, {passive:true});
+    onResize();
+
     loadSettingsIntoUI();
     renderBook();
     renderDeviceSelect();

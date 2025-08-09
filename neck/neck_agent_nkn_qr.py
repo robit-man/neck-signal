@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-app.py — QR handshake + multi-peer streaming (DM) with ultra-low backoff.
-
-What’s new in this build
-------------------------
-- Node bridge DM retries are minimal: default tries=1 for frames, with backoff clamped to ≤20ms.
-- Python sender passes `backoffMs` to the bridge; frames use tries=1, backoffMs=10 (fire-and-forget-ish).
-- MultiClient subclients bumped to 6 for better route availability.
-- Keeps: multi-peer grants, per-peer /res % command, per-scale JPEG cache, addresses.json persistence.
-
-NOTE: This still uses NKN **DM** for frames. If you want true fire-and-forget broadcast,
-      switch to publish-on-secret-topic (I can wire that next).
+app.py — NKN QR handshake, multi-peer grayscale streaming, and DM commands
+- QR scan from VIDEO_URL using the same low-latency method as qr_scan.py
+- Grants (v1/v2) → saves peer to addresses.json → streams frames to ALL peers
+- Per-peer /res <percent> to change resolution scale
+- /stats on|off | /stats hz <n> | /stats once
+- Serial actuator commands: "X100,Y-50,Z0,H30,S1,A1,R0,P0" or "home"
+- Aggressive DM: 2 tries, 20ms constant backoff (in Node sidecar)
 """
 
 # ──────────────────────────────────────────────────────────────────────
-# 0) venv bootstrap (stdlib only)
+# 0) venv bootstrap (stdlib)
 # ──────────────────────────────────────────────────────────────────────
 import os, sys, subprocess, json, time, threading, base64, re, signal
 from pathlib import Path
@@ -38,14 +34,14 @@ def _create_venv():
 if not _in_venv():
     _create_venv()
     subprocess.check_call([str(PY_VENV), "-m", "pip", "install", "--quiet",
-                           "numpy", "opencv-python", "pynacl", "requests"])
+                           "numpy", "opencv-python", "pynacl", "requests", "pyserial"])
     os.execv(str(PY_VENV), [str(PY_VENV), *sys.argv])
 
 # ──────────────────────────────────────────────────────────────────────
 # 1) imports (inside venv)
 # ──────────────────────────────────────────────────────────────────────
 import argparse
-from typing import Optional, Dict, Any, Tuple, List, Set
+from typing import Optional, Dict, Any, Tuple, List
 import urllib.parse
 import requests
 import numpy as np
@@ -56,19 +52,18 @@ import shutil
 from subprocess import Popen, PIPE
 from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
+import serial  # pyserial
 
 # ──────────────────────────────────────────────────────────────────────
 # 2) args & .env
 # ──────────────────────────────────────────────────────────────────────
 cli = argparse.ArgumentParser()
 cli.add_argument("--video-url", default=os.environ.get("VIDEO_URL", "http://127.0.0.1:8080/video/rs_color"))
-cli.add_argument("--stream-hz", type=int, default=int(os.environ.get("STREAM_HZ", "20")))
-cli.add_argument("--scan-max-width", type=int, default=int(os.environ.get("SCAN_MAX_WIDTH", "640")))
+cli.add_argument("--stream-hz", type=int, default=int(os.environ.get("STREAM_HZ", "30")))
+cli.add_argument("--scan-max-width", type=int, default=int(os.environ.get("SCAN_MAX_WIDTH", "960")))
 cli.add_argument("--label", default=os.environ.get("DEVICE_LABEL","neck-agent"))
 cli.add_argument("--uuid", default=os.environ.get("DEVICE_UUID",""))
-cli.add_argument("--jpeg-quality", type=int, default=int(os.environ.get("JPEG_QUALITY","55")))
-cli.add_argument("--max-jpeg-bytes", type=int, default=int(os.environ.get("MAX_JPEG_BYTES","60000")))
-cli.add_argument("--default-scale", type=int, default=int(os.environ.get("DEFAULT_SCALE_PCT","50")))
+cli.add_argument("--subclients", type=int, default=int(os.environ.get("SUBCLIENTS","8")))
 args = cli.parse_args()
 
 ENV_PATH = BASE_DIR / ".env"
@@ -92,13 +87,11 @@ if "DEVICE_TOPIC_PREFIX" not in dotenv:
 if "REV_COUNTER" not in dotenv:
     dotenv["REV_COUNTER"] = "0"
 
-dotenv["VIDEO_URL"]       = args.video_url or dotenv.get("VIDEO_URL","http://127.0.0.1:8080/video/rs_color")
-dotenv["STREAM_HZ"]       = str(max(1, min(60, int(args.stream_hz))))
-dotenv["SCAN_MAX_WIDTH"]  = str(max(0, min(2560, int(args.scan_max_width))))
-dotenv["DEVICE_UUID"]     = args.uuid or dotenv.get("DEVICE_UUID") or str(_uuid.uuid4())
-dotenv["JPEG_QUALITY"]    = str(max(10, min(95, int(args.jpeg_quality))))
-dotenv["MAX_JPEG_BYTES"]  = str(max(20_000, min(200_000, int(args.max_jpeg_bytes))))
-dotenv["DEFAULT_SCALE_PCT"]= str(max(10, min(100, int(args.default_scale))))
+dotenv["VIDEO_URL"]      = args.video_url or dotenv.get("VIDEO_URL","http://127.0.0.1:8080/video/rs_color")
+dotenv["STREAM_HZ"]      = str(max(1, min(60, int(args.stream_hz))))
+dotenv["SCAN_MAX_WIDTH"] = str(max(0, min(2560, int(args.scan_max_width))))
+dotenv["DEVICE_UUID"]    = args.uuid or dotenv.get("DEVICE_UUID") or str(_uuid.uuid4())
+dotenv["SUBCLIENTS"]     = str(max(1, min(16, int(args.subclients))))
 _save_env(ENV_PATH, dotenv)
 
 DEVICE_SEED_HEX = dotenv["DEVICE_SEED_HEX"].lower().replace("0x","")
@@ -109,12 +102,10 @@ STREAM_HZ       = max(1, min(60, int(dotenv["STREAM_HZ"])))
 SCAN_MAX_WIDTH  = max(0, min(2560, int(dotenv["SCAN_MAX_WIDTH"])))
 DEVICE_UUID     = dotenv["DEVICE_UUID"]
 DEVICE_LABEL    = args.label
-JPEG_QUALITY    = max(10, min(95, int(dotenv["JPEG_QUALITY"])))
-MAX_JPEG_BYTES  = max(20_000, min(200_000, int(dotenv["MAX_JPEG_BYTES"])))
-DEFAULT_SCALE_PCT = max(10, min(100, int(dotenv["DEFAULT_SCALE_PCT"])))
+SUBCLIENTS      = max(1, min(16, int(dotenv["SUBCLIENTS"])))
 
 # ──────────────────────────────────────────────────────────────────────
-# 3) NKN bridge (Node.js sidecar) — backoff clamped to ≤20ms
+# 3) NKN bridge (Node.js sidecar) — aggressive low backoff
 # ──────────────────────────────────────────────────────────────────────
 NODE_DIR = BASE_DIR / "device-bridge"
 NODE_BIN = shutil.which("node")
@@ -132,43 +123,43 @@ if not PKG_JSON.exists():
     subprocess.check_call([NPM_BIN, "install", "nkn-sdk@^1.3.6"], cwd=NODE_DIR, stdout=subprocess.DEVNULL)
 
 BRIDGE_SRC = r"""
-/* nkn_device_bridge.js — DM with ultra-low backoff; inbound passthrough */
+/* nkn_device_bridge.js — NKN DM bridge with aggressive low-latency send.
+   - MultiClient (numSubClients from env)
+   - JSON line IPC with Python
+   - sendDMWithRetry: constant backoff 20ms, tries=2 (fire-and-forget-ish)
+*/
 const nkn = require('nkn-sdk');
 const readline = require('readline');
 
 const SEED_HEX = (process.env.DEVICE_SEED_HEX || '').toLowerCase().replace(/^0x/,'');
 const IDENT    = process.env.DEVICE_IDENT || 'device';
 const TOPIC_NS = process.env.DEVICE_TOPIC_PREFIX || 'roko-signaling';
+const SUBS     = Math.max(1, Math.min(16, parseInt(process.env.SUBCLIENTS || '8', 10)));
 
 function log(...args){ console.error('[device-bridge]', ...args); }
-function sendToPy(obj){ try { process.stdout.write(JSON.stringify(obj) + '\n'); } catch {} }
+function sendToPy(obj){ process.stdout.write(JSON.stringify(obj) + '\n'); }
 function isFullAddr(s){ return typeof s === 'string' && /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/i.test((s||'').trim()); }
 function isHex64(s){ return typeof s === 'string' && /^[0-9a-f]{64}$/i.test((s||'').trim()); }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-async function sendDMWithRetry(client, dest, data, tries=1, backoffMs=10){
-  const d = String(dest||'').trim();
-  if (!isFullAddr(d) && !isHex64(d)) { log('dm aborted: invalid dest', d); return false; }
-  const bms = Math.max(0, Math.min(20, (backoffMs|0))); // clamp to ≤20ms
-  for (let i=0; i<Math.max(1, tries|0); i++){
-    try {
-      await client.send(d, JSON.stringify(data));
-      return true;
-    } catch(e){
-      if (i === (tries-1)) break;
-      if (bms > 0) await sleep(bms);
-    }
+async function sendDMWithRetry(client, dest, data, tries=2){
+  if (!isFullAddr(dest) && !isHex64(dest)) { return false; }
+  const body = JSON.stringify(data);
+  const t = Math.max(1, Math.min(3, parseInt(tries || 2, 10)));
+  for (let i=0;i<t;i++){
+    try { await client.send(dest, body); return true; }
+    catch(e){ await sleep(20); } // 20ms constant backoff cap
   }
   return false;
 }
 
 (async () => {
   if (!/^[0-9a-f]{64}$/i.test(SEED_HEX)) throw new RangeError('invalid hex seed');
-  const client = new nkn.MultiClient({ seed: SEED_HEX, identifier: IDENT, numSubClients: 6 });
+  const client = new nkn.MultiClient({ seed: SEED_HEX, identifier: IDENT, numSubClients: SUBS });
 
   client.on('connect', () => {
-    sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS });
-    log('ready at', client.addr);
+    sendToPy({ type: 'ready', address: client.addr, topicPrefix: TOPIC_NS, subs: SUBS });
+    log('ready at', client.addr, 'subs=', SUBS);
   });
 
   client.on('message', (a,b) => {
@@ -190,9 +181,9 @@ async function sendDMWithRetry(client, dest, data, tries=1, backoffMs=10){
     if (!line) return;
     let cmd; try { cmd = JSON.parse(line); } catch { return; }
     if (cmd.type === 'dm') {
-      await sendDMWithRetry(client, String(cmd.to||'').trim(), cmd.data, cmd.tries ?? 1, cmd.backoffMs ?? 10);
+      await sendDMWithRetry(client, String(cmd.to||'').trim(), cmd.data, cmd.tries || 2);
     } else if (cmd.type === 'pub') {
-      try { await client.publish(TOPIC_NS + '.' + cmd.topic, JSON.stringify(cmd.data)); } catch(e) { log('pub err', e?.message||e); }
+      try { await client.publish(TOPIC_NS + '.' + cmd.topic, JSON.stringify(cmd.data)); } catch {}
     }
   });
 })();
@@ -204,6 +195,7 @@ bridge_env = os.environ.copy()
 bridge_env["DEVICE_SEED_HEX"]     = DEVICE_SEED_HEX
 bridge_env["DEVICE_IDENT"]        = os.environ.get("DEVICE_IDENT","device")
 bridge_env["DEVICE_TOPIC_PREFIX"] = TOPIC_PREFIX
+bridge_env["SUBCLIENTS"]          = str(SUBCLIENTS)
 
 bridge = Popen(
     [str(shutil.which("node")), str(BRIDGE_JS)],
@@ -211,7 +203,7 @@ bridge = Popen(
     stdin=PIPE, stdout=PIPE, stderr=PIPE, text=True, bufsize=1
 )
 
-state: Dict[str, Any] = {"client_address": None, "topic_prefix": TOPIC_PREFIX}
+state: Dict[str, Any] = {"client_address": None, "topic_prefix": TOPIC_PREFIX, "subs": SUBCLIENTS}
 
 def _bridge_send(obj: dict):
     try:
@@ -219,8 +211,8 @@ def _bridge_send(obj: dict):
     except Exception as e:
         print("bridge send error:", e)
 
-def _dm(dest: str, data: dict, tries: int = 1, backoff_ms: int = 10):
-    _bridge_send({"type":"dm","to":dest,"data":data,"tries":tries,"backoffMs":backoff_ms})
+def _dm(dest: str, data: dict, tries: int = 2):
+    _bridge_send({"type":"dm","to":dest,"data":data,"tries":tries})
 
 def _shutdown(*_):
     try:
@@ -232,23 +224,12 @@ def _shutdown(*_):
         cv2.destroyAllWindows()
     except Exception:
         pass
+    try:
+        if ser is not None and ser.is_open:
+            ser.close()
+    except Exception:
+        pass
     sys.exit(0)
-
-# inbound from bridge
-def _handle_inbound(src_addr: str, body: Any):
-    if not isinstance(body, dict): return
-    # Commands from client UIs
-    cmd = body.get("cmd") or (body.get("event") == "cmd" and body.get("data"))
-    if isinstance(cmd, str):
-        m = re.match(r"^\s*/res\s+(\d{1,3})\s*%?\s*$", cmd)
-        if m:
-            pct = max(10, min(100, int(m.group(1))))
-            with peers_lock:
-                peer = peers.get(src_addr)
-                if peer:
-                    peer["scale_pct"] = pct
-                    peer["last_cmd"] = time.time()
-            _dm(src_addr, {"event":"ack","cmd":cmd,"ok":True,"scalePct":pct}, tries=2, backoff_ms=20)
 
 def _bridge_reader():
     for line in bridge.stdout:
@@ -262,9 +243,15 @@ def _bridge_reader():
         if msg.get("type") == "ready":
             state["client_address"] = msg.get("address")
             state["topic_prefix"]   = msg.get("topicPrefix") or TOPIC_PREFIX
-            print(f"→ NKN ready: {state['client_address']}")
+            state["subs"]           = int(msg.get("subs") or SUBCLIENTS)
+            print(f"→ NKN ready: {state['client_address']}  subs={state['subs']}")
         elif msg.get("type") == "nkn-message":
-            _handle_inbound(msg.get("src") or "", msg.get("msg"))
+            src = (msg.get("src") or "").strip()
+            payload = msg.get("msg")
+            try:
+                handle_inbound_command(src, payload)
+            except Exception as e:
+                print("inbound handler error:", e)
 
 def _bridge_err():
     for line in bridge.stderr:
@@ -353,69 +340,111 @@ def scopes_from_short(s_short: str) -> List[str]:
         out = ['video:rgb']
     return out
 
-BOOK_PATH = BASE_DIR / "addresses.json"  # persistent peers
-def _load_book() -> dict:
-    if BOOK_PATH.exists():
-        try: return json.loads(BOOK_PATH.read_text())
+# ──────────────────────────────────────────────────────────────────────
+# 5) address book (persist peer endpoints)
+# ──────────────────────────────────────────────────────────────────────
+ADDR_PATH = BASE_DIR / "addresses.json"
+def _load_addresses() -> Dict[str, Dict[str, Any]]:
+    if ADDR_PATH.exists():
+        try: return json.loads(ADDR_PATH.read_text())
         except: return {}
     return {}
-def _save_book(b: dict):
-    BOOK_PATH.write_text(json.dumps(b, indent=2))
-book = _load_book()
+def _save_addresses(d: Dict[str, Dict[str, Any]]):
+    ADDR_PATH.write_text(json.dumps(d, indent=2))
 
-def grant_for(client_pub_hex: str, scopes_list: List[str], exp_unix: int) -> dict:
-    token_body = {
-        "v": 1,
-        "sub": client_pub_hex,
-        "scopes": scopes_list,
-        "exp": int(exp_unix),
-        "device": state.get("client_address") or f"device.{DEVICE_PUBHEX}",
-        "rc": REV_COUNTER
-    }
-    token = sign_token(token_body)
-    return {"token": token, "exp": token_body["exp"], "scopes": token_body["scopes"], "device": token_body["device"]}
-
-# ──────────────────────────────────────────────────────────────────────
-# 5) Pairing & peers
-# ──────────────────────────────────────────────────────────────────────
-peers_lock = threading.Lock()
-# peers[dest_addr] = {pubhex, scopes, scale_pct, jpeg_q, last_cmd}
+# peers runtime: addr -> state
+# state: {"scale":float,"stats_on":bool,"stats_hz":int,"last_stats_ts":float,"sent_since_tick":int,"last_tick_ts":float}
 peers: Dict[str, Dict[str, Any]] = {}
+addresses = _load_addresses()  # persisted config (label, scopes, scale, exp, device)
 
-# preload from addresses.json
-for dest_addr, meta in _load_book().items():
-    if isinstance(meta, dict):
-        peers[dest_addr] = {
-            "pubhex": meta.get("pubhex",""),
-            "scopes": meta.get("scopes",["video:rgb"]),
-            "scale_pct": int(meta.get("scale_pct", DEFAULT_SCALE_PCT)),
-            "jpeg_q": int(meta.get("jpeg_q", JPEG_QUALITY)),
-            "last_cmd": 0.0,
+def _ensure_peer(addr: str, *, default_scale: float = 1.0) -> Dict[str, Any]:
+    st = peers.get(addr)
+    if st is None:
+        st = {
+            "scale": float(addresses.get(addr,{}).get("scale", default_scale)),
+            "stats_on": False,
+            "stats_hz": 1,
+            "last_stats_ts": 0.0,
+            "sent_since_tick": 0,
+            "last_tick_ts": time.time(),
         }
+        peers[addr] = st
+    return st
 
-def _remember_peer(dest_addr: str, pubhex: str, scopes: List[str]):
-    b = _load_book()
-    entry = b.get(dest_addr, {})
-    entry.update({
-        "pubhex": pubhex,
+def _persist_peer(addr: str, label: str, scopes: List[str], exp: int, device: str, *, scale: float = 1.0):
+    addresses[addr] = {
+        "label": label,
         "scopes": scopes,
-        "scale_pct": entry.get("scale_pct", DEFAULT_SCALE_PCT),
-        "jpeg_q": entry.get("jpeg_q", JPEG_QUALITY),
-        "updated": int(time.time()),
-    })
-    b[dest_addr] = entry
-    _save_book(b)
-    with peers_lock:
-        peers[dest_addr] = {
-            "pubhex": pubhex,
-            "scopes": scopes,
-            "scale_pct": int(entry["scale_pct"]),
-            "jpeg_q": int(entry["jpeg_q"]),
-            "last_cmd": 0.0,
-        }
+        "exp": int(exp),
+        "device": device,
+        "scale": float(scale),
+        "last_seen": int(time.time())
+    }
+    _save_addresses(addresses)
+    _ensure_peer(addr, default_scale=scale)
 
 # ──────────────────────────────────────────────────────────────────────
-# 6) EXACT grabber/resize/draw from qr_scan.py (low-latency)
+# 6) serial: actuator commands
+# ──────────────────────────────────────────────────────────────────────
+SER_POSSIBLE = ["/dev/ttyUSB0","/dev/ttyUSB1","/dev/tty0","/dev/tty1","COM3","COM4"]
+ser: Optional[serial.Serial] = None
+def _open_serial():
+    global ser
+    if ser is not None and ser.is_open:
+        return
+    for p in SER_POSSIBLE:
+        try:
+            ser = serial.Serial(p, 115200, timeout=1)
+            print("[serial] opened:", p)
+            break
+        except Exception:
+            ser = None
+    if ser is None:
+        print("[serial] no device found (commands will still be ACKed)")
+_open_serial()
+
+ALLOWED = {
+    "X": (-700, 700, int), "Y": (-700, 700, int), "Z": (-700, 700, int),
+    "H": (0, 70, int),     "S": (0, 10, float),   "A": (0, 10, float),
+    "R": (-700, 700, int), "P": (-700, 700, int),
+}
+state_axes = {k: (1.0 if k in ("S","A") else 0) for k in ALLOWED}
+
+def _validate_axes_cmd(cmd:str)->bool:
+    if cmd.lower()=="home": return True
+    seen=set()
+    for tok in cmd.split(","):
+        m = re.match(r"^([XYZHSARP])(-?\d+(?:\.\d+)?)$", tok.strip())
+        if not m or m.group(1) in seen: return False
+        k,val = m.group(1), m.group(2); low,high,cast = ALLOWED[k]
+        try: v=cast(val)
+        except: return False
+        if not low<=v<=high: return False
+        seen.add(k)
+    return True
+
+def _merge_axes_cmd(cmd:str)->str:
+    if cmd.lower()=="home":
+        for k in state_axes: state_axes[k]=1.0 if k in ("S","A") else 0
+        return "HOME"
+    for tok in cmd.split(","):
+        m = re.match(r"^([XYZHSARP])(-?\d+(?:\.\d+)?)$", tok.strip())
+        if m:
+            k,val=m.group(1),m.group(2); state_axes[k]=ALLOWED[k][2](val)
+    return ",".join(f"{k}{state_axes[k]}" for k in ["X","Y","Z","H","S","A","R","P"])
+
+def _serial_send(full:str)->bool:
+    try:
+        _open_serial()
+        if ser is not None and ser.is_open:
+            ser.write((full+"\n").encode())
+            return True
+    except Exception as e:
+        print("[serial] error:", e)
+    return False
+
+# ──────────────────────────────────────────────────────────────────────
+# 7) EXACT grabber/resize/draw from qr_scan.py
 # ──────────────────────────────────────────────────────────────────────
 class LatestFrameGrabber:
     def __init__(self, url: str):
@@ -472,45 +501,69 @@ def resize_keep_aspect(img: np.ndarray, max_w: int) -> Tuple[np.ndarray, float]:
     return out, scale
 
 def draw_polys(img: np.ndarray, polys: List[np.ndarray], color=(0, 255, 0)):
-    if not polys: return
+    if not polys:
+        return
     for p in polys:
         pts = np.asarray(p, dtype=np.int32).reshape(-1, 2)
         cv2.polylines(img, [pts], True, color, 2, cv2.LINE_AA)
 
 # ──────────────────────────────────────────────────────────────────────
-# 7) QR parse → grant → remember peer
+# 8) QR → handshake → start streaming (multi-peer)
 # ──────────────────────────────────────────────────────────────────────
-def process_qr_payload(txt: str) -> Tuple[bool, str, Optional[str], List[str]]:
+def _encode_jpeg_gray(gray: np.ndarray, quality: int = 65) -> Tuple[Optional[str], int]:
+    try:
+        ok, buf = cv2.imencode(".jpg", gray, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if not ok:
+            return None, 0
+        raw = buf.tobytes()
+        return base64.b64encode(raw).decode("ascii"), len(raw)
+    except Exception:
+        return None, 0
+
+def grant_for(client_pub_hex: str, scopes_list: List[str], exp_unix: int) -> dict:
+    token_body = {
+        "v": 1,
+        "sub": client_pub_hex,
+        "scopes": scopes_list,
+        "exp": int(exp_unix),
+        "device": state.get("client_address") or f"device.{DEVICE_PUBHEX}",
+        "rc": REV_COUNTER
+    }
+    token = sign_token(token_body)
+    return {"token": token, "exp": token_body["exp"], "scopes": token_body["scopes"], "device": token_body["device"]}
+
+def process_qr_payload(txt: str) -> Tuple[bool, str, Optional[str], List[str], int]:
     """
-    Returns (ok, message, full_dest_addr, scopes_list). Sends GRANT if verified.
+    Returns (ok, message, dest_addr, scopes_list, exp_unix). Sends GRANT if verified.
+    dest_addr is FULL "<identifier>.<pubhex>" (identifier defaults to "client" if not provided)
     """
     try:
         if not txt.startswith("nkn+invite:"):
-            return False, "QR not an NKN invite", None, []
+            return False, "QR not an NKN invite", None, [], 0
         qs = txt[len("nkn+invite:"):]
         params = urllib.parse.parse_qs(qs, keep_blank_values=True)
         get = lambda k: (params.get(k,[""])[0] or "").strip()
         v = get("v") or "1"
 
-        # v2 compact (preferred)
+        # v2 compact
         if v == "2" or get("a"):
             a  = get("a"); s = get("s"); e = get("e"); n = get("n"); g = get("g")
             ident = get("i") or "client"
             if not (a and s and e and n and g):
-                return False, "Invite v2 missing fields", None, []
+                return False, "Invite v2 missing required fields", None, [], 0
             ok, client_pub_hex = verify_invite_sig_v2(a, s, e, n, g)
             if not ok or not client_pub_hex:
-                return False, "Bad v2 invite signature", None, []
+                return False, "Bad v2 invite signature", None, [], 0
             try: exp_unix = int(e, 36)
-            except Exception: return False, "Invalid v2 expiry", None, []
+            except Exception: return False, "Invalid v2 expiry", None, [], 0
             if exp_unix < int(time.time()) - 2:
-                return False, "Invite expired", None, []
+                return False, "Invite expired", None, [], 0
             scopes_list = scopes_from_short(s)
             dest_addr = f"{ident}.{client_pub_hex}"
             grant = grant_for(client_pub_hex, scopes_list, exp_unix)
-            _dm(dest_addr, {"v":2,"type":"grant","grant":grant}, tries=2, backoff_ms=20)
-            _remember_peer(dest_addr, client_pub_hex, scopes_list)
-            return True, f"GRANTED (v2) to {dest_addr}", dest_addr, scopes_list
+            _dm(dest_addr, {"v":2,"type":"grant","grant":grant}, tries=2)
+            _persist_peer(dest_addr, ident, grant["scopes"], grant["exp"], grant["device"], scale=1.0)
+            return True, f"GRANTED (v2) to {dest_addr}", dest_addr, scopes_list, exp_unix
 
         # v1 legacy
         caddr  = get("clientAddr")
@@ -520,34 +573,139 @@ def process_qr_payload(txt: str) -> Tuple[bool, str, Optional[str], List[str]]:
         nonce  = get("nonce")
         sig    = get("sig")
         ident  = get("i") or "client"
+
         if not (caddr and scopes_csv and exp and nonce and sig):
-            return False, "Invite v1 missing fields", None, []
+            return False, "Invite v1 missing required fields", None, [], 0
         ok_v1, client_pub_hex = verify_invite_sig_v1(caddr, v, scopes_csv, exp, nonce, sig)
         if not ok_v1 or not client_pub_hex:
-            return False, "Bad v1 invite signature", None, []
+            return False, "Bad v1 invite signature", None, [], 0
         scopes_list = [s.strip() for s in scopes_csv.split(",") if s.strip()]
-        dest_addr = caddr.strip() if re.fullmatch(r"[A-Za-z0-9_-]+\.([0-9a-fA-F]{64})", caddr.strip()) \
-                   else f"{ident}.{client_pub_hex}"
+        if re.fullmatch(r"[A-Za-z0-9_-]+\.([0-9a-fA-F]{64})", (caddr or "").strip()):
+            dest_addr = caddr.strip()
+        else:
+            dest_addr = f"{ident}.{client_pub_hex}"
         exp_unix = int(exp)
         grant = grant_for(client_pub_hex, scopes_list, exp_unix)
-        _dm(dest_addr, {"v":1,"type":"grant","grant":grant}, tries=2, backoff_ms=20)
-        _remember_peer(dest_addr, client_pub_hex, scopes_list)
-        return True, f"GRANTED (v1) to {label or dest_addr}", dest_addr, scopes_list
+        _dm(dest_addr, {"v":1,"type":"grant","grant":grant}, tries=2)
+        _persist_peer(dest_addr, label or ident, grant["scopes"], grant["exp"], grant["device"], scale=1.0)
+        return True, f"GRANTED (v1) to {dest_addr}", dest_addr, scopes_list, exp_unix
 
     except Exception as e:
-        return False, f"QR error: {e}", None, []
+        return False, f"QR error: {e}", None, [], 0
 
 # ──────────────────────────────────────────────────────────────────────
-# 8) QR scanner (exact method as qr_scan.py) + streaming loop
+# 9) inbound commands (DM) → per-peer scale, stats, serial control
 # ──────────────────────────────────────────────────────────────────────
-def _encode_jpeg_b64_gray(gray: np.ndarray, quality: int) -> Optional[str]:
-    try:
-        ok, buf = cv2.imencode(".jpg", gray, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-        if not ok: return None
-        return base64.b64encode(buf.tobytes()).decode("ascii")
-    except Exception:
-        return None
+def _ack(addr: str, ok: bool, note: str):
+    _dm(addr, {"event": "ack", "ok": bool(ok), "note": note})
 
+def _update_scale(addr: str, scale: float):
+    st = _ensure_peer(addr)
+    st["scale"] = float(max(0.1, min(1.0, scale)))
+    # persist into addresses.json
+    if addr in addresses:
+        addresses[addr]["scale"] = float(st["scale"])
+        addresses[addr]["last_seen"] = int(time.time())
+        _save_addresses(addresses)
+    _ack(addr, True, f"resolution set to {int(st['scale']*100)}%")
+
+def send_stats_now(addr: str, st: Dict[str, Any], *, last_bytes: int = 0, w: int = 0, h: int = 0):
+    now = time.time()
+    tick_dt = max(1e-6, now - st.get("last_tick_ts", now))
+    fps_out = st.get("sent_since_tick", 0) / tick_dt
+    msg = {
+        "event": "stats",
+        "fps_out": round(fps_out, 2),
+        "jpeg_bytes": int(last_bytes),
+        "scale": round(st.get("scale", 1.0), 3),
+        "w": int(w),
+        "h": int(h),
+        "ts": int(now * 1000),
+    }
+    _dm(addr, msg)
+    # reset tick counters
+    st["sent_since_tick"] = 0
+    st["last_tick_ts"] = now
+
+def handle_inbound_command(src_addr: str, payload: Any):
+    if not src_addr:
+        return
+    # Normalize to a command string or actuator string
+    raw = None
+    if isinstance(payload, dict) and payload.get("event") == "cmd":
+        raw = payload.get("cmd") or payload.get("data") or ""
+    elif isinstance(payload, dict) and "data" in payload and isinstance(payload["data"], str):
+        # legacy: {"event":"peer-message","data":"X10,Y-5"}
+        raw = payload.get("data","")
+    elif isinstance(payload, str):
+        raw = payload
+    elif isinstance(payload, dict) and "raw" in payload and isinstance(payload["raw"], str):
+        raw = payload["raw"]
+    if not raw:
+        return
+
+    cmd = raw.strip()
+
+    # /res <percent>
+    if cmd.lower().startswith("/res"):
+        parts = cmd.split()
+        if len(parts) >= 2:
+            p = parts[1].rstrip("%")
+            try:
+                pct = float(p)
+                _update_scale(src_addr, pct/100.0)
+                return
+            except Exception:
+                pass
+        _ack(src_addr, False, "usage: /res <percent>  e.g. /res 50%")
+        return
+
+    # /stats ...
+    if cmd.lower().startswith("/stats"):
+        st = _ensure_peer(src_addr)
+        toks = cmd.split()
+        if len(toks) == 1:
+            _ack(src_addr, True, f"stats={'on' if st['stats_on'] else 'off'} hz={st['stats_hz']}")
+            return
+        arg = toks[1].lower()
+        if arg in ("on","off"):
+            st["stats_on"] = (arg == "on")
+            _ack(src_addr, True, f"stats {arg}")
+            return
+        if arg == "hz" and len(toks) >= 3:
+            try:
+                hz = max(1, min(10, int(toks[2])))
+                st["stats_hz"] = hz
+                _ack(src_addr, True, f"stats hz={hz}")
+            except Exception:
+                _ack(src_addr, False, "usage: /stats hz <1..10>")
+            return
+        if arg == "once":
+            send_stats_now(src_addr, st)
+            return
+        _ack(src_addr, False, "usage: /stats on|off | /stats hz <n> | /stats once")
+        return
+
+    # /home shortcut
+    if cmd.lower() in ("/home","home"):
+        full = "HOME"
+        ok = _serial_send(full)
+        _ack(src_addr, ok, "HOME sent" if ok else "no serial")
+        return
+
+    # If it looks like actuator command:
+    if _validate_axes_cmd(cmd):
+        full = _merge_axes_cmd(cmd)
+        ok = _serial_send(full)
+        _ack(src_addr, ok, f"serial: {full}" if ok else "no serial")
+        return
+
+    # unknown
+    _ack(src_addr, False, "unknown command")
+
+# ──────────────────────────────────────────────────────────────────────
+# 10) main run: scan, pair, broadcast frames to all peers
+# ──────────────────────────────────────────────────────────────────────
 def run():
     # wait NKN ready
     t0 = time.time()
@@ -555,6 +713,12 @@ def run():
         if time.time() - t0 > 15:
             print("NKN not ready, exiting."); _shutdown()
         time.sleep(0.02)
+
+    # Preload any persisted peers so they start receiving immediately
+    if addresses:
+        for addr, meta in addresses.items():
+            _ensure_peer(addr, default_scale=float(meta.get("scale",1.0)))
+        print(f"[peers] restored {len(addresses)} from addresses.json")
 
     print(f"[qr] opening: {VIDEO_URL}")
     grabber = LatestFrameGrabber(VIDEO_URL)
@@ -567,11 +731,8 @@ def run():
     fps = 0.0
     stream_period = 1.0 / float(STREAM_HZ)
     last_stream = 0.0
-    seen_invites: Set[str] = set()
 
-    # per-scale encode cache (encode once per scale per frame)
-    cache_b64: Dict[int, str] = {}
-    cache_key_frame_id = 0
+    seen_invites = set()
 
     try:
         while True:
@@ -580,16 +741,16 @@ def run():
                 time.sleep(0.001)
                 continue
 
-            # Optional working resize for scanning
+            # Optional working resize for QR
             work, scale = resize_keep_aspect(frame, SCAN_MAX_WIDTH) if SCAN_MAX_WIDTH > 0 else (frame, 1.0)
-            gray_scan = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+            gray_for_qr = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
 
             decoded_strings: List[str] = []
             polys_full: List[np.ndarray] = []
 
             # Multi
             try:
-                retval, decoded_info, pts, _ = detector.detectAndDecodeMulti(gray_scan)
+                retval, decoded_info, pts, _ = detector.detectAndDecodeMulti(gray_for_qr)
                 if pts is not None and len(pts):
                     for poly in pts:
                         p = (np.asarray(poly).reshape(-1, 2) * scale).astype(np.float32)
@@ -602,7 +763,7 @@ def run():
             # Single fallback
             if not decoded_strings:
                 try:
-                    txt, pts, _ = detector.detectAndDecode(gray_scan)
+                    txt, pts, _ = detector.detectAndDecode(gray_for_qr)
                     if pts is not None and len(pts):
                         p = (np.asarray(pts).reshape(-1, 2) * scale).astype(np.float32)
                         polys_full.append(p)
@@ -611,19 +772,20 @@ def run():
                 except Exception:
                     pass
 
-            # Print ALL decoded strings (debugging)
+            # Print ALL decoded strings (every frame) like qr_scan.py
             for s in decoded_strings:
                 print(s)
 
-            # Pair newly-seen invites
+            # On first verified invite(s), add peers
             for s in decoded_strings:
-                if s in seen_invites: continue
-                ok, msg, dest_addr, scopes = process_qr_payload(s)
+                if s in seen_invites:
+                    continue
+                ok, msg, dest_addr, scopes, exp = process_qr_payload(s)
                 if ok and dest_addr:
                     print(msg)
                 seen_invites.add(s)
 
-            # Draw detections on original frame
+            # Draw detections on ORIGINAL frame
             vis = frame.copy()
             draw_polys(vis, polys_full, color=(0, 255, 0))
 
@@ -643,52 +805,47 @@ def run():
             if key == 27 or key == ord('q'):
                 break
 
-            # STREAM to all remembered peers at STREAM_HZ
-            tnow = time.time()
-            if tnow - last_stream >= stream_period and peers:
-                last_stream = tnow
-                # bump cache frame id
-                cache_key_frame_id += 1
-                cache_b64.clear()
+            # Broadcast frames to ALL peers (per-peer scale)
+            if peers:
+                tnow = time.time()
+                if tnow - last_stream >= stream_period:
+                    last_stream = tnow
+                    # Make base grayscale once
+                    gray_base = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    # Group peers by unique scale to avoid repeated resizes
+                    scale_groups: Dict[float, List[str]] = {}
+                    for addr in list(peers.keys()):
+                        st = _ensure_peer(addr)
+                        sc = float(st.get("scale", 1.0))
+                        scale_groups.setdefault(sc, []).append(addr)
 
-                # base grayscale once
-                gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-                # prepare unique scales used by peers
-                with peers_lock:
-                    peer_items = list(peers.items())
-
-                scales_needed = sorted({ max(10, min(100, int(meta["scale_pct"]))) for _, meta in peer_items })
-                for pct in scales_needed:
-                    if pct not in cache_b64:
-                        if pct == 100:
-                            img = gray_full
+                    scaled_cache: Dict[float, np.ndarray] = {}
+                    for sc, addrs in scale_groups.items():
+                        if abs(sc - 1.0) > 1e-3:
+                            w = int(gray_base.shape[1] * sc)
+                            h = int(gray_base.shape[0] * sc)
+                            if w < 2 or h < 2:
+                                w = max(2, w); h = max(2, h)
+                            gray_scaled = cv2.resize(gray_base, (w, h), interpolation=cv2.INTER_AREA)
                         else:
-                            h, w = gray_full.shape[:2]
-                            nw = max(1, int(w * pct / 100.0))
-                            nh = max(1, int(h * pct / 100.0))
-                            img = cv2.resize(gray_full, (nw, nh), interpolation=cv2.INTER_AREA)
-                        # encode with clamp if oversized
-                        q = JPEG_QUALITY
-                        b64 = _encode_jpeg_b64_gray(img, q)
-                        if b64 and len(b64) * 3 // 4 > MAX_JPEG_BYTES:
-                            # drop quality in small steps until under cap or hit floor
-                            for q2 in (50, 45, 40, 35, 30, 28, 26, 24, 22, 20):
-                                b64 = _encode_jpeg_b64_gray(img, q2)
-                                if b64 and (len(b64) * 3 // 4) <= MAX_JPEG_BYTES:
-                                    break
-                        if b64:
-                            cache_b64[pct] = b64
+                            gray_scaled = gray_base
+                        scaled_cache[sc] = gray_scaled
 
-                # send to each peer using its scale; frames use tries=1, backoffMs=10
-                for dest_addr, meta in peer_items:
-                    if "video:rgb" not in (meta.get("scopes") or ["video:rgb"]): 
-                        continue
-                    pct = max(10, min(100, int(meta.get("scale_pct", DEFAULT_SCALE_PCT))))
-                    b64 = cache_b64.get(pct)
-                    if not b64:
-                        continue
-                    _dm(dest_addr, {"event":"frame-color","uuid":DEVICE_UUID,"data":b64}, tries=1, backoff_ms=10)
+                        # Encode once per scale, then DM to all addrs in that group
+                        b64, raw_bytes = _encode_jpeg_gray(gray_scaled, quality=65)
+                        if not b64:
+                            continue
+                        payload = {"event":"frame-color","uuid":DEVICE_UUID,"data":b64}
+                        for addr in addrs:
+                            _dm(addr, payload, tries=2)
+                            st = _ensure_peer(addr)
+                            st["sent_since_tick"] = st.get("sent_since_tick", 0) + 1
+                            # periodic stats
+                            if st.get("stats_on", False):
+                                per = 1.0 / max(1, int(st.get("stats_hz", 1)))
+                                if tnow - st.get("last_stats_ts", 0.0) >= per:
+                                    send_stats_now(addr, st, last_bytes=raw_bytes, w=gray_scaled.shape[1], h=gray_scaled.shape[0])
+                                    st["last_stats_ts"] = tnow
 
     finally:
         grabber.stop()
@@ -696,7 +853,7 @@ def run():
         except Exception: pass
 
 # ──────────────────────────────────────────────────────────────────────
-# 9) main
+# 11) main
 # ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _shutdown)
