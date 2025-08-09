@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>NKN Client — QR Pair (Mobile First)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f14">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%230b0f14'/%3E%3Ctext x='32' y='40' font-size='28' text-anchor='middle' fill='%23ecf2f8' font-family='Arial'%3EN%3C/text%3E%3C/svg%3E" />
+  <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tweetnacl/1.0.3/nacl.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
+  <style>
+    :root{
+      --bg:#0b0f14; --fg:#ecf2f8; --muted:#9fb3c8; --panel:#111723; --panel2:#172133;
+      --ok:#2ecc71; --warn:#f39c12; --bad:#e74c3c; --accent:#4dd0ff; --radius:14px;
+    }
+    *{box-sizing:border-box; -webkit-tap-highlight-color: transparent;}
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;}
+    a{color:inherit}
+    .qrwrap canvas, .qrwrap img { image-rendering: pixelated; width:auto!important; height:auto!important; max-width:100%; display:block; }
+
+    /* Header chips scroll horizontally on overflow (mobile) */
+    header.app .chiprow{
+      display:flex; gap:8px; flex:1 1 auto; min-width:0;
+      overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap; padding:0 4px;
+    }
+    header.app{
+      position:sticky; top:0; z-index:2;
+      padding:12px max(12px, env(safe-area-inset-left)) 12px max(12px, env(safe-area-inset-right));
+      background:var(--panel); border-bottom:1px solid #0e141c; display:flex; gap:8px; align-items:center;
+    }
+    header.app h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.3px;flex:0 0 auto}
+    .chip{padding:6px 10px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:12px;white-space:nowrap;flex:0 0 auto}
+    .actions{flex:0 0 auto; display:flex; gap:8px}
+    .btn{appearance:none;border:1px solid #1f2a3a;background:var(--panel2);color:var(--fg);padding:10px 14px;border-radius:10px;font-weight:600}
+    .btn:active{transform:scale(.98)} .btn.wide{width:100%}
+
+    main{display:flex; flex-direction:column; gap:12px; padding:12px max(12px, env(safe-area-inset-left)) 24px max(12px, env(safe-area-inset-right));}
+    section.card{border:1px solid #0e141c; border-radius:var(--radius); background:var(--panel); overflow:hidden; display:flex; flex-direction:column;}
+    section.card > .title{padding:12px; background:var(--panel2); border-bottom:1px solid #0e141c; display:flex; align-items:center; justify-content:space-between; gap:8px; font-weight:700;}
+    section.card .content{padding:12px}
+    .row{display:flex; gap:10px; align-items:center; margin:10px 0}
+    .kv{display:grid; grid-template-columns:120px 1fr; gap:8px 12px}
+    input[type="text"], input[type="number"], select{
+      width:100%; background:#0f1520; color:var(--fg); border:1px solid #1f2a3a; border-radius:10px; padding:10px 12px; outline:none; font-size:15px;
+    }
+    input[type="range"]{width:100%}
+    .small{font-size:12px;color:var(--muted)} .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    .list{display:flex;flex-direction:column;gap:10px}
+    .cardline{border:1px solid #1b2533; border-radius:12px; padding:10px 12px; background:#0f1520; display:flex; gap:10px; justify-content:space-between; align-items:center}
+    .copybtn{border:1px solid #263249;background:#182238;color:var(--fg);padding:8px 10px;border-radius:8px}
+
+    .modal{position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:10; background:rgba(0,0,0,.6)}
+    .modal .box{width:min(520px, 94vw); background:var(--panel); border:1px solid #1b2533; border-radius:16px; overflow:hidden}
+    .modal .box .head{display:flex;justify-content:space-between;align-items:center;padding:12px;background:var(--panel2);border-bottom:1px solid #0e141c}
+    .modal .box .body{padding:12px}
+    .qrwrap{display:flex;align-items:center;justify-content:center;padding:8px}
+    .qrwrap > div{width:min(80vw, 360px); height:min(80vw, 360px); background:#fff; padding:12px; border-radius:12px}
+
+    .toast{position:fixed; left:50%; transform:translateX(-50%); bottom:calc(16px + env(safe-area-inset-bottom)); background:#0f1520; border:1px solid #1f2a3a; padding:10px 14px; border-radius:12px; display:none}
+
+    .live-wrap{display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap}
+    .live-panel{display:flex; flex-direction:column; gap:8px}
+    .canvasbox{background:#000; border:1px solid #1b2533; border-radius:12px; overflow:hidden; max-width:640px; width:100%}
+    .canvasbox canvas{display:block; width:100%; height:auto}
+
+    @media (min-width: 920px){
+      main{display:grid; grid-template-columns: 1fr; align-items:start}
+      .kv{grid-template-columns:350px 2fr}
+    }
+  </style>
+</head>
+<body>
+  <header class="app">
+    <h1>NKN Client</h1>
+    <div class="chiprow" id="chipRow">
+      <span class="chip" id="chipAddr">addr: —</span>
+      <span class="chip" id="chipReady">status: idle</span>
+      <span class="chip" id="chipSubs">subclients: —</span>
+    </div>
+    <div class="actions">
+      <button class="btn" id="btnShowQR" aria-label="Show Invite QR">Invite</button>
+      <button class="btn" id="btnSettings" aria-label="Open Settings">Settings</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card" id="secStatus">
+      <div class="title">Connectivity & Metrics</div>
+      <div class="content">
+        <div class="kv">
+          <div>Label</div><div id="kvLabel" class="mono"></div>
+          <div>PubKey</div><div id="kvPub" class="mono small"></div>
+          <div>Seed</div><div id="kvSeed" class="mono small"></div>
+          <div>NKN</div><div id="kvReady">connecting…</div>
+          <div>Error</div><div id="kvErr" class="small"></div>
+        </div>
+        <div class="row small">Tip: tap <b>Invite</b> and present the QR to the device’s camera.</div>
+      </div>
+    </section>
+
+    <section class="card" id="secLive">
+      <div class="title">
+        <span>Live View & Commands</span>
+        <div class="small">Device: <select id="selDevice"></select></div>
+      </div>
+      <div class="content">
+        <div class="live-wrap">
+          <div class="live-panel" style="flex:1 1 360px; min-width:280px;">
+            <div class="canvasbox"><canvas id="liveCanvas" width="640" height="360" aria-label="Live frame"></canvas></div>
+            <div class="small">fps: <span id="liveFps">0.0</span> • last: <span id="liveMeta">—</span></div>
+
+            <!-- Three.js pose viewer -->
+            <div class="canvasbox" style="margin-top:8px;"><canvas id="poseCanvas" width="640" height="360" aria-label="Phone pose"></canvas></div>
+            <div class="row">
+              <button class="btn" id="btnSensors" title="Request motion/orientation permission (iOS)">Sensors</button>
+              <button class="btn" id="btnCenter"  title="Center orientation baseline">Center</button>
+              <button class="btn" id="btnOrient"  title="Toggle orientation streaming">Orientation: Off</button>
+            </div>
+            <div class="small mono" id="yprLabel">Yaw 0° • Pitch 0° • Roll 0°</div>
+          </div>
+
+          <div class="live-panel" style="min-width:260px; flex:1 1 300px;">
+            <div><b>Resolution</b> (<span id="resVal">60</span>%)</div>
+            <input id="resSlider" type="range" min="20" max="100" step="5" value="60" />
+            <div class="small">Sends <code>/res N%</code> to the selected device.</div>
+
+            <div class="row" style="margin-top:10px;">
+              <input id="cmdText" type="text" placeholder="Command e.g. X100,Y-50 or /home or /stats on" />
+              <button class="btn" id="btnSendCmd">Send</button>
+            </div>
+
+            <div style="display:flex; gap:8px; margin-top:8px;">
+              <button class="btn" id="btnStatsOnce">Stats once</button>
+              <button class="btn" id="btnStatsToggle">Stats on/off</button>
+            </div>
+
+            <div class="small mono" id="cmdAck" style="margin-top:8px; max-width:48ch; word-break:break-word;"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="secBook">
+      <div class="title">
+        <span>Address Book (grants)</span>
+        <button class="btn" id="btnClearBook">Clear</button>
+      </div>
+      <div class="content">
+        <div id="bookList" class="list"></div>
+      </div>
+    </section>
+
+    <section class="card" id="secSettings">
+      <div class="title">
+        <span>Client Settings</span>
+        <button class="btn" id="btnSave">Save</button>
+      </div>
+      <div class="content">
+        <div class="row"><label style="min-width:110px">Label</label><input id="inpLabel" type="text" placeholder="My Phone" /></div>
+        <div class="row"><label style="min-width:110px">Seed (64-hex)</label><input id="inpSeed" type="text" placeholder="Auto if empty" /></div>
+        <div class="row"><label style="min-width:110px">Scopes (CSV)</label><input id="inpScopes" type="text" value="video:rgb" /></div>
+        <div class="row"><label style="min-width:110px">Expiry (minutes)</label><input id="inpExpMin" type="number" value="60" /></div>
+        <div class="small">Seed is stored locally; keys are Ed25519 (same for NKN & invite signing).</div>
+        <div class="row" style="margin-top:16px;"><button class="btn wide" id="btnRestart">Restart NKN Client</button></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- QR Modal -->
+  <div id="qrModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="qrTitle">
+    <div class="box">
+      <div class="head"><div id="qrTitle" style="font-weight:700;">Invite QR</div><button class="btn" id="btnCloseQR">Close</button></div>
+      <div class="body">
+        <div class="qrwrap"><div id="qrBox" aria-label="QR code for device pairing"></div></div>
+        <div class="small mono" id="qrText" style="word-break:break-all;"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <!-- Core NKN client + UI logic -->
+  <script>
+  window.addEventListener('DOMContentLoaded', () => {
+    const $ = s => document.querySelector(s);
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    const now = () => Date.now()/1000;
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const b64u = {
+      enc: (u8) => btoa(String.fromCharCode(...u8)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),
+      dec: (s) => { s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4)s+='='; return new Uint8Array([...atob(s)].map(c=>c.charCodeAt(0))); }
+    };
+    const looksHex64 = s => /^[0-9a-f]{64}$/i.test((s||'').trim());
+    const debounce = (fn, ms=250) => { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
+
+    const toast = (msg) => { const el=$('#toast'); el.textContent = msg; el.style.display='block'; setTimeout(()=> el.style.display='none', 1600); };
+
+    // Local storage
+    const LS = {
+      read(){ try { return JSON.parse(localStorage.getItem('nkn_client_cfg')||'{}'); } catch { return {}; } },
+      write(v){ localStorage.setItem('nkn_client_cfg', JSON.stringify(v)); }
+    };
+    const BOOK = {
+      read(){ try { return JSON.parse(localStorage.getItem('nkn_address_book')||'[]'); } catch { return []; } },
+      write(a){ localStorage.setItem('nkn_address_book', JSON.stringify(a)); renderBook(); renderDeviceSelect(); },
+      add(e){ const a=BOOK.read().filter(x=>x.device!==e.device); a.unshift(e); BOOK.write(a); },
+      clear(){ BOOK.write([]); }
+    };
+
+    // keys
+    function seedHexToKeyPair(seedHex){
+      let seed;
+      if (seedHex && looksHex64(seedHex)) seed = new Uint8Array(seedHex.match(/../g).map(b=>parseInt(b,16)));
+      else { seed = new Uint8Array(32); crypto.getRandomValues(seed);
+        seedHex = [...seed].map(b=>b.toString(16).padStart(2,'0')).join('');
+        const cfg=LS.read(); cfg.seedHex=seedHex; LS.write(cfg); }
+      const kp = nacl.sign.keyPair.fromSeed(seed);
+      return { seedHex, pubHex: [...kp.publicKey].map(b=>b.toString(16).padStart(2,'0')).join(''), kp };
+    }
+
+    // NKN client
+    const state = { client:null, ready:false, dm:null, addr:'', err:'', subs:6, kp:null, targetDevice:'' };
+
+    async function startClient(seedHex){
+      const client = new nkn.MultiClient({ seed: seedHex, identifier:'client', numSubClients: state.subs });
+      state.client = client; state.ready=false;
+      $('#chipReady').textContent = 'status: connecting…';
+      $('#kvReady').textContent = 'connecting…';
+      $('#chipSubs').textContent = `subclients: ${state.subs}`;
+
+      const ready = new Promise(res => client.onConnect(res));
+      ready.then(() => {
+        state.ready = true;
+        state.addr = client.addr;
+        $('#chipAddr').textContent = `addr: ${client.addr}`;
+        $('#chipReady').textContent = 'status: ready';
+        $('#kvReady').textContent = 'ready';
+      });
+
+      client.on('message', (a,b) => {
+        let src, payload;
+        if (a && typeof a==='object' && (a.payload!==undefined || a.data!==undefined || a.src!==undefined)){
+          src = a.src || a.from || a.addr || ''; payload = (a.payload!==undefined) ? a.payload : a.data;
+        } else { src=a; payload=b; }
+        let txt=''; try {
+          if (payload instanceof Uint8Array) txt=dec.decode(payload);
+          else if (typeof payload==='string') txt=payload;
+          else txt=JSON.stringify(payload);
+        } catch {}
+        let body={}; try{ body=JSON.parse(txt); }catch{ body={ raw: txt }; }
+        handleInbound(src, body);
+      });
+
+      state.dm = async function dm(dest, data, tries=6){
+        await ready;
+        let lastErr=null;
+        for (let i = 0; i < tries; i++) {
+          try { await client.send(dest, JSON.stringify(data)); return true; }
+          catch(e){ lastErr=e; state.err = e?.message || String(e); $('#kvErr').textContent = state.err;
+            await sleep(Math.min(1500, 120*Math.pow(2,i))); }
+        }
+        return false;
+      };
+
+      // Expose a tiny hook for the Three.js module
+      window.NKN = {
+        hasTarget: ()=> !!state.targetDevice,
+        sendCmd: (cmd)=> state.targetDevice ? state.dm(state.targetDevice, {event:'cmd', cmd:String(cmd)}) : Promise.resolve(false),
+        sendRaw: (obj)=> state.targetDevice ? state.dm(state.targetDevice, obj) : Promise.resolve(false),
+        toast
+      };
+    }
+
+    // Inbound: grant → address book; frames → live canvas; ack/stats → status line
+    const canvas = $('#liveCanvas');
+    const ctx = canvas.getContext('2d');
+    let lastDraw = performance.now(), drawCount = 0, fps = 0.0;
+
+    function drawFrameFromBase64(b64){
+      const img = new Image();
+      img.onload = () => {
+        // Fit to container width
+        const cssW = canvas.parentElement.clientWidth || 640;
+        const scale = Math.min(1, cssW / img.width);
+        const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+        canvas.width = w; canvas.height = h;
+        ctx.drawImage(img, 0, 0, w, h);
+        drawCount++; const nowp=performance.now();
+        if (nowp - lastDraw >= 1000){ fps = drawCount * 1000 / (nowp - lastDraw); drawCount=0; lastDraw=nowp; $('#liveFps').textContent = fps.toFixed(1); }
+      };
+      img.src = 'data:image/jpeg;base64,' + b64;
+    }
+
+    function handleInbound(src, body){
+      if (!body || typeof body!=='object') return;
+      if (body.type==='grant' && body.grant && body.grant.token){
+        const g = body.grant;
+        BOOK.add({ device: g.device || 'device', token: g.token, scopes: g.scopes || [], exp: g.exp || 0, receivedAt: Math.floor(Date.now()/1000), from: src });
+        toast('Grant received');
+      } else if (body.event === 'frame-color' && body.data){
+        $('#liveMeta').textContent = `from ${src}`;
+        drawFrameFromBase64(body.data);
+      } else if (body.event === 'ack' || body.event === 'cmd-ack'){
+        const ok = body.ok ? '✓' : '✗';
+        const msg = body.note || body.msg || '';
+        $('#cmdAck').textContent = `${ok} ${msg}`;
+      } else if (body.event === 'stats'){
+        const s = body;
+        $('#cmdAck').textContent = `fps_out=${s.fps_out} size=${s.jpeg_bytes} w=${s.w} h=${s.h}`;
+      } else if (body.event === 'hello'){
+        // presence handshake (optional)
+        window.NKN?.sendRaw({event:'hello-ack'});
+      }
+    }
+
+    // UI wiring: settings & QR
+    function loadSettingsIntoUI(){
+      const cfg = LS.read();
+      $('#inpLabel').value  = cfg.label || 'My Client';
+      $('#inpSeed').value   = cfg.seedHex || '';
+      $('#inpScopes').value = cfg.scopes || 'video:rgb';
+      $('#inpExpMin').value = cfg.expMin || 60;
+      const { seedHex, pubHex } = seedHexToKeyPair(cfg.seedHex||'');
+      $('#kvLabel').textContent = cfg.label || 'My Client';
+      $('#kvPub').textContent   = pubHex;
+      $('#kvSeed').textContent  = looksHex64(seedHex) ? 'stored' : 'generated';
+    }
+    function saveSettingsFromUI(){
+      const cfg = LS.read();
+      cfg.label = ($('#inpLabel').value || 'My Client').trim();
+      const s   = ($('#inpSeed').value||'').trim().toLowerCase().replace(/^0x/,'');
+      if (s && !looksHex64(s)){ alert('Seed must be 64 hex'); return; }
+      cfg.seedHex = s || cfg.seedHex || '';
+      cfg.scopes  = ($('#inpScopes').value || 'video:rgb').trim();
+      cfg.expMin  = Math.max(1, parseInt($('#inpExpMin').value||'60',10));
+      LS.write(cfg);
+      loadSettingsIntoUI();
+      startOrRestart();
+    }
+
+    function renderBook(){
+      const list = $('#bookList'); list.innerHTML='';
+      const items = BOOK.read();
+      if (!items.length){ list.innerHTML='<div class="small">No grants yet. Use <b>Invite</b> to pair.</div>'; return; }
+      for (const e of items){
+        const div=document.createElement('div');
+        div.className='cardline';
+        div.innerHTML=`
+          <div style="min-width:0">
+            <div><strong>${e.device}</strong> <span class="small">from: ${e.from||'?'}</span></div>
+            <div class="small">scopes: ${e.scopes?.join(', ')||'-'} | exp: ${e.exp||0} | received: ${e.receivedAt}</div>
+            <div class="small mono" style="max-width: 72vw; overflow:auto">${e.token}</div>
+          </div>
+          <div style="flex:0 0 auto"><button class="copybtn" data-copy="${e.token}">Copy</button></div>`;
+        list.appendChild(div);
+      }
+      list.querySelectorAll('button[data-copy]').forEach(btn=>{
+        btn.onclick=()=>{ navigator.clipboard?.writeText(btn.getAttribute('data-copy')).then(()=>toast('Copied')); };
+      });
+    }
+
+    function renderDeviceSelect(){
+      const sel = $('#selDevice');
+      const items = BOOK.read();
+      const prev = sel.value;
+      sel.innerHTML = '';
+      for (const e of items){
+        const opt = document.createElement('option');
+        opt.value = e.device; opt.textContent = e.device;
+        sel.appendChild(opt);
+      }
+      if (items.length){
+        sel.value = items.find(x=>x.device===prev)?.device || items[0].device;
+        state.targetDevice = sel.value;
+      } else {
+        state.targetDevice = '';
+      }
+    }
+
+    function showInviteQR(){
+      const cfg = LS.read();
+      const { kp } = seedHexToKeyPair(cfg.seedHex||'');
+      const clientPubB64u = b64u.enc(kp.publicKey);
+      const scopesShort = 'r'; // "video:rgb"
+      const expSec = Math.floor(Date.now()/1000) + (Math.max(1, cfg.expMin||60)*60);
+      const exp36 = expSec.toString(36);
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const canonical = `2|${clientPubB64u}|${scopesShort}|${exp36}|${b64u.enc(nonce)}`;
+      const sig = nacl.sign.detached(enc.encode(canonical), kp.secretKey);
+      const url = `nkn+invite:v=2&a=${encodeURIComponent(clientPubB64u)}&s=${scopesShort}&e=${exp36}&n=${encodeURIComponent(b64u.enc(nonce))}&g=${encodeURIComponent(b64u.enc(sig))}&i=client`;
+
+      const box = $('#qrBox'); box.innerHTML='';
+      new QRCode(box, { text: url, width: 336, height: 336, correctLevel: QRCode.CorrectLevel.M });
+      $('#qrText').textContent = url;
+      $('#qrModal').style.display='flex';
+    }
+
+    function startOrRestart(){
+      const cfg = LS.read();
+      const { seedHex, kp } = seedHexToKeyPair(cfg.seedHex||'');
+      state.kp = kp;
+      startClient(seedHex);
+    }
+
+    // Command sending
+    const sendResDebounced = debounce((pct)=>{
+      if (!state.targetDevice){ toast('No device selected'); return; }
+      const cmd = `/res ${pct}%`;
+      state.dm(state.targetDevice, {event:'cmd', cmd}).then(()=> { $('#cmdAck').textContent = '…sent /res'; });
+    }, 250);
+
+    const sendCmd = ()=>{
+      if (!state.targetDevice){ toast('No device selected'); return; }
+      const raw = ($('#cmdText').value || '').trim();
+      if (!raw){ toast('Enter a command'); return; }
+      state.dm(state.targetDevice, {event:'cmd', cmd: raw}).then(()=> { $('#cmdAck').textContent = '…sent'; });
+    };
+
+    $('#selDevice').addEventListener('change', (e)=>{ state.targetDevice = e.target.value || ''; });
+    $('#resSlider').addEventListener('input', (e)=>{
+      const v = parseInt(e.target.value,10); $('#resVal').textContent = v;
+      sendResDebounced(v);
+    });
+    $('#btnSendCmd').onclick = sendCmd;
+    $('#cmdText').addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); sendCmd(); } });
+
+    $('#btnStatsOnce').onclick = ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {event:'cmd', cmd:'/stats once'}); };
+    $('#btnStatsToggle').onclick= ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {event:'cmd', cmd:'/stats'}); };
+
+    // Events
+    $('#btnSettings').onclick = () => document.querySelector('#secSettings').scrollIntoView({behavior:'smooth'});
+    $('#btnSave').onclick = saveSettingsFromUI;
+    $('#btnRestart').onclick = startOrRestart;
+    $('#btnShowQR').onclick = showInviteQR;
+    $('#btnCloseQR').onclick = () => { $('#qrModal').style.display='none'; };
+    $('#btnClearBook').onclick = () => { if (confirm('Clear all grants?')) { BOOK.clear(); renderDeviceSelect(); } };
+
+    // Boot
+    function onResize(){ // keep canvas fitting container on rotate
+      const w = canvas.parentElement.clientWidth || 640;
+      const h = Math.round(w * (9/16));
+      canvas.width = w; canvas.height = h;
+    }
+    window.addEventListener('resize', onResize, {passive:true});
+    onResize();
+
+    loadSettingsIntoUI();
+    renderBook();
+    renderDeviceSelect();
+    startOrRestart();
+  });
+  </script>
+
+  <!-- three.js importmap + module for pose + orientation → command -->
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.175.0/build/three.module.js" } }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+
+    const poseCanvas = document.getElementById('poseCanvas');
+    const btnSensors = document.getElementById('btnSensors');
+    const btnCenter  = document.getElementById('btnCenter');
+    const btnOrient  = document.getElementById('btnOrient');
+    const yprLabel   = document.getElementById('yprLabel');
+
+    // Renderer / Scene
+    const renderer = new THREE.WebGLRenderer({ canvas: poseCanvas, antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a0a);
+    const cam = new THREE.PerspectiveCamera(55, 16/9, 0.1, 50);
+    cam.position.set(0, 0, 4);
+    scene.add(cam);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x222222, 1.0));
+    const dl = new THREE.DirectionalLight(0xffffff, 0.35); dl.position.set(1,1,1); scene.add(dl);
+
+    // Phone slab
+    const phone = new THREE.Mesh(
+      new THREE.BoxGeometry(0.7, 1.4, 0.05),
+      new THREE.MeshBasicMaterial({ color: 0x1976d2, wireframe: true, transparent: true, opacity: 0.25 })
+    );
+    scene.add(phone);
+
+    // Grid plane
+    const grid = new THREE.GridHelper(10, 10, 0x333333, 0x222222);
+    grid.position.y = -1; scene.add(grid);
+
+    function resizePose() {
+      const rect = poseCanvas.parentElement.getBoundingClientRect();
+      const w = Math.max(280, rect.width);
+      const h = Math.round(w * (9/16));
+      renderer.setSize(w, h, false);
+      cam.aspect = w / h; cam.updateProjectionMatrix();
+    }
+    window.addEventListener('resize', resizePose, {passive:true});
+    resizePose();
+
+    // Orientation math
+    const rad = THREE.MathUtils.degToRad;
+    const deg = THREE.MathUtils.radToDeg;
+    const corrQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2);
+
+    let curQuat  = new THREE.Quaternion();
+    let baseQuat = null;
+
+    let yaw=0, pitch=0, roll=0;
+    let accel = {x:0,y:0,z:0};
+    let trans = {Y:0,Z:0,H:0};
+
+    const GAIN_YAW=8, GAIN_PITCH=8, GAIN_ROLL=8;
+    const DECAY = 0.90;
+
+    function deviceToQuat(alpha, beta, gamma) {
+      const e = new THREE.Euler(rad(beta), rad(alpha), -rad(gamma), 'YXZ');
+      const q = new THREE.Quaternion().setFromEuler(e);
+      q.multiply(corrQuat);
+      return q;
+    }
+
+    function getRelativeYPRDeg() {
+      if (!baseQuat) return {yaw:0,pitch:0,roll:0};
+      const invBase = baseQuat.clone().invert();
+      const rel = invBase.multiply(curQuat);
+      const e = new THREE.Euler().setFromQuaternion(rel, 'YXZ');
+      return { yaw: deg(e.y), pitch: deg(e.x), roll: deg(e.z) };
+    }
+
+    // Render loop
+    function loop(){ renderer.render(scene, cam); requestAnimationFrame(loop); }
+    loop();
+
+    // Sensors
+    async function requestSensorPermissions() {
+      try {
+        let p1 = (window.DeviceMotionEvent && typeof DeviceMotionEvent.requestPermission === 'function')
+          ? await DeviceMotionEvent.requestPermission() : 'granted';
+        let p2 = (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function')
+          ? await DeviceOrientationEvent.requestPermission() : 'granted';
+        if (p1 !== 'granted' || p2 !== 'granted') {
+          window.NKN?.toast?.('Enable motion/orientation in browser settings');
+          return false;
+        }
+        return true;
+      } catch { return true; }
+    }
+
+    btnSensors.addEventListener('click', async () => {
+      if (await requestSensorPermissions()) btnSensors.disabled = true;
+    });
+    if (!/iphone|ipad|ipod/i.test(navigator.userAgent)) btnSensors.disabled = true;
+
+    window.addEventListener('deviceorientation', e => {
+      if (e.alpha == null) return;
+      yaw = e.alpha; pitch = e.beta; roll = e.gamma;
+      curQuat.copy(deviceToQuat(yaw, pitch, roll));
+      phone.setRotationFromQuaternion(curQuat);
+      yprLabel.textContent = `Yaw ${yaw.toFixed(0)}° • Pitch ${pitch.toFixed(0)}° • Roll ${roll.toFixed(0)}°`;
+    }, true);
+
+    window.addEventListener('devicemotion', e => {
+      let a = e.acceleration && (e.acceleration.x!=null) ? e.acceleration : e.accelerationIncludingGravity;
+      if (a) accel = { x: a.x || 0, y: a.y || 0, z: a.z || 0 };
+    }, true);
+
+    btnCenter.addEventListener('click', () => { baseQuat = curQuat.clone(); });
+
+    // Orientation streaming toggle
+    let orientOn = false;
+    let tickTimer = null;
+    const TICK_MS = 60; // ~16 Hz
+
+    const clamp = (v,min,max)=>Math.min(max,Math.max(min,v));
+    const decay = v => (Math.abs(v) < 1 ? 0 : v*DECAY);
+
+    function makeCommand(){
+      // transient translations from accel
+      trans.Z = clamp(decay(trans.Z + (-accel.y*10)), -400, 400);  // forward/back
+      trans.H = clamp(decay(trans.H + ( accel.z* 2)),   20,  50);  // up/down (0..50 clamp later)
+      trans.Y = clamp(decay(trans.Y + ( accel.x*10)), -400, 400);  // left/right
+
+      const { yaw:yDeg, pitch:pDeg, roll:rDeg } = getRelativeYPRDeg();
+      const X = clamp(-yDeg * GAIN_YAW,   -400, 400);
+      const P = clamp( pDeg * GAIN_PITCH, -400, 400);
+      const R = clamp( rDeg * GAIN_ROLL,  -400, 400);
+      const H = clamp(trans.H, 0, 50);
+
+      return `X${X.toFixed(0)},Y${trans.Y.toFixed(0)},Z${trans.Z.toFixed(0)},H${H.toFixed(0)},S1,A1,R${R.toFixed(0)},P${P.toFixed(0)}`;
+    }
+
+    function tick(){
+      if (!window.NKN?.hasTarget?.()) return;
+      const cmd = makeCommand();
+      window.NKN.sendCmd(cmd);
+      // (optional) surface what we’re sending in the ack area without spamming
+      const ack = document.getElementById('cmdAck');
+      if (ack && Math.random() < 0.07) ack.textContent = `→ ${cmd}`;
+    }
+
+    function setOrient(on){
+      orientOn = !!on;
+      btnOrient.textContent = orientOn ? 'Orientation: On' : 'Orientation: Off';
+      if (tickTimer) { clearInterval(tickTimer); tickTimer=null; }
+      if (orientOn){
+        if (!baseQuat) baseQuat = curQuat.clone();
+        tickTimer = setInterval(tick, TICK_MS);
+      }
+    }
+    btnOrient.addEventListener('click', ()=> setOrient(!orientOn));
+  </script>
+</body>
+</html>
