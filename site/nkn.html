@@ -1,731 +1,539 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Neck-Phone Controller (NKN-first)</title>
+<head>
+  <meta charset="utf-8" />
+  <title>NKN Viewer (Browser)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- NKN SDK (browser build) -->
+  <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
+  <style>
+    :root {
+      --bg: #0b0f14; --fg: #ecf2f8; --muted:#9fb3c8; --accent:#4dd0ff; --danger:#ff5c5c;
+      --panel:#121821; --panel2:#1a2230; --overlay:rgba(0,0,0,.55);
+    }
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial, sans-serif; }
+    header { padding:10px 14px; background:var(--panel); border-bottom:1px solid #0e141c; display:flex; gap:12px; align-items:center; }
+    header h1 { font-size:14px; margin:0; font-weight:600; letter-spacing:.5px; }
+    header .chip { padding:4px 8px; border-radius:999px; background:var(--panel2); color:var(--muted); }
+    main { display:flex; gap:10px; padding:12px; height:calc(100% - 54px); box-sizing:border-box; }
+    .view { flex:1; position:relative; border:1px solid #0e141c; border-radius:8px; overflow:hidden; background:#000; min-height:200px; }
+    .view canvas, .view img { width:100%; height:100%; display:block; object-fit:contain; background:#000; }
+    .overlay {
+      position:absolute; left:0; top:0; right:0; height:40px; background:linear-gradient(180deg, rgba(0,0,0,.6), rgba(0,0,0,0));
+      display:flex; align-items:center; gap:12px; padding:8px 10px; box-sizing:border-box; pointer-events:none; font-size:12px;
+    }
+    .overlay .tag { background:rgba(255,255,255,.12); padding:3px 8px; border-radius:999px; }
+    .bar { display:flex; gap:8px; align-items:center; margin-left:auto; }
+    .btn { background:var(--panel2); border:1px solid #1f2a3a; color:var(--fg); padding:8px 12px; border-radius:6px; cursor:pointer; }
+    .btn:hover { filter:brightness(1.15); }
+    .muted { color:var(--muted); }
 
-<style>
-  :root { color-scheme: dark; }
-  html, body { height:100%; width:100%; overflow:hidden; position:relative; margin:0; }
-  body {
-    background:#111; color:#fafafa; font:16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-  }
-  header {
-    position: sticky; top: 0; z-index: 10; background: #111; border-bottom: 1px solid #333;
-    display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: .5rem;
-    padding: .5rem .75rem;
-  }
-  #status { font-size: 1.6rem; }
-  .actions { display:flex; gap:.5rem; }
-  button, input, select {
-    background:#181818; color:#fff; border:1px solid #444; border-radius:.35rem;
-    padding:.45rem .7rem; font:inherit;
-  }
-  button:hover { background:#222; }
-  main { position:relative; width:100%; height:calc(100% - 54px); display:grid; }
-  .row { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Roboto Mono", monospace; }
-  .panel { border:1px solid #333; border-radius:.5rem; padding:.75rem; background:#121212; }
-  .muted { opacity:.7; }
-  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:.75rem; }
-  .frame { border:1px solid #222; background:#0a0a0a; border-radius:.35rem; overflow:hidden; position:relative; }
-  .frame .pad { width:100%; aspect-ratio:16/9; background:#0a0a0a; display:grid; place-items:center; }
-  .frame img { width:100%; height:100%; object-fit:contain; display:block; background:#000; }
-
-  #poseWrap { border:1px solid #222; border-radius:.35rem; overflow:hidden; }
-  #poseCanvas { width:100%; height:100%; display:block; }
-
-  #configDlg[hidden] { display:none; }
-  #configDlg {
-    position:fixed; inset:0; background:rgba(0,0,0,.6); display:grid; place-items:center;
-  }
-  #configDlg .card {
-    width:min(92vw, 560px); background:#171717; border:1px solid #333; border-radius:.6rem;
-    padding:1rem; display:grid; gap:.85rem;
-  }
-  .grid { display:grid; gap:.5rem; }
-  .rangeRow { display:grid; gap:.5rem; grid-template-columns: 1fr minmax(4.5rem, 6rem); align-items:center; }
-  .flips { display:grid; grid-template-columns: repeat(6, auto); gap:.5rem .75rem; align-items:center; }
-</style>
-
-<!-- Optional Socket.IO client (only used if you provide a server URL/pw) -->
-<script src="https://unpkg.com/socket.io-client@4.7.5/dist/socket.io.min.js"></script>
-<!-- NKN SDK (global `nkn`) -->
-<script src="https://cdn.jsdelivr.net/npm/nkn-sdk@1.3.1/dist/nkn.min.js"></script>
-
+    /* Modal */
+    .modal-backdrop {
+      position:fixed; inset:0; background:var(--overlay); display:none; align-items:center; justify-content:center; z-index:1000;
+    }
+    .modal { width:min(560px, 92vw); background:var(--panel); border:1px solid #1b2533; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.5); }
+    .modal header { background:transparent; border:0; padding:14px 16px; }
+    .modal h2 { margin:0; font-size:16px; }
+    .modal .content { padding:0 16px 16px 16px; }
+    .form { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .form .row { display:flex; flex-direction:column; gap:6px; }
+    .form label { font-size:12px; color:var(--muted); }
+    .form input[type="text"], .form input[type="number"] {
+      background:#0f1520; border:1px solid #1f2a3a; color:var(--fg); border-radius:6px; padding:8px 10px; outline:none;
+    }
+    .form input[type="checkbox"] { transform:scale(1.1); }
+    .form .row span.help { font-size:11px; color:var(--muted); }
+    .modal footer { display:flex; gap:10px; padding:12px 16px 16px; justify-content:flex-end; }
+    .err { color:var(--danger); font-size:12px; margin-top:6px; min-height:1em; }
+    .hidden { display:none !important; }
+    .statusline { padding:0 12px; color:var(--muted); }
+  </style>
+</head>
 <body>
   <header>
-    <div id="status" title="Connection status">🔴</div>
-    <div class="actions">
-      <button id="btnPerms" title="Request motion/orientation permission (iOS)">Enable Sensors</button>
-      <button id="btnCenter" title="Center orientation (set baseline)">Center</button>
-      <button id="btnHome" title="Send HOME and pause streaming 5s">HOME</button>
-      <button id="btnSettings" title="Open settings">Settings</button>
+    <h1>NKN Viewer</h1>
+    <span class="chip" id="addrChip">addr: —</span>
+    <span class="chip" id="topicChip">topic: —</span>
+    <div class="bar">
+      <button class="btn" id="openSettings">Settings</button>
+      <button class="btn" id="restartBtn">Restart</button>
     </div>
   </header>
 
   <main>
-    <div id="poseWrap" class="panel" style="min-height: 300px; margin:.75rem;">
-      <div class="muted mono" style="margin-bottom:.5rem;">Phone Pose + Depth Mesh</div>
-      <div class="row mono" style="margin-bottom:.5rem;">
-        <div id="whichRobot">robot: —</div>
-        <div id="orient" style="margin-left:auto;">Yaw 0° &nbsp; Pitch 0° &nbsp; Roll 0°</div>
-      </div>
-      <canvas id="poseCanvas"></canvas>
-    </div>
-
-    <!-- Optional 2D previews (kept but hidden by default) -->
-    <section class="panel" style="display:none; margin:.75rem;">
-      <div class="grid2">
-        <div class="frame">
-          <div class="muted mono" style="padding:.4rem .5rem;">Color</div>
-          <div id="wrapColor" class="pad"><img id="imgColor" alt="color"></div>
-        </div>
-        <div class="frame">
-          <div class="muted mono" style="padding:.4rem .5rem;">Depth</div>
-          <div id="wrapDepth" class="pad"><img id="imgDepth" alt="depth"></div>
-        </div>
-      </div>
-      <div class="row mono" style="margin-top:.5rem;">
-        <div id="cmd">X0,Y0,Z0,H0,S1,A1,R0,P0</div>
-      </div>
+    <section class="view" id="colorView">
+      <div class="overlay"><span class="tag">COLOR</span><span class="muted" id="colorMeta"></span></div>
+      <canvas id="colorCanvas"></canvas>
+    </section>
+    <section class="view" id="depthView" style="display:none">
+      <div class="overlay"><span class="tag">DEPTH</span><span class="muted" id="depthMeta"></span></div>
+      <canvas id="depthCanvas"></canvas>
     </section>
   </main>
+  <div class="statusline" id="status">idle</div>
 
-  <!-- Settings / first-run -->
-  <div id="configDlg">
-    <div class="card">
-      <h2 class="mono" style="margin:0;">Connect to signaling</h2>
-      <form id="cfgForm" class="grid">
-        <label class="grid">
-          <span>Signaling Server URL (optional; WS fallback)</span>
-          <input id="srv" placeholder="http://localhost:3000">
-        </label>
-        <label class="grid">
-          <span>Shared Password (only if using WS fallback)</span>
-          <input id="pw" placeholder="••••••••">
-        </label>
-
-        <div class="grid">
-          <label>Stream Update Interval</label>
-          <div class="rangeRow">
-            <input id="rateSlider" type="range" min="10" max="100" step="1">
-            <div class="row">
-              <input id="rateBox" type="number" min="0.01" max="0.10" step="0.01" class="mono" style="width:5.5rem;">
-              <span class="muted">sec</span>
-            </div>
+  <!-- Modal -->
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <header><h2 id="modalTitle">Viewer Settings</h2></header>
+      <div class="content">
+        <form id="cfgForm" class="form">
+          <div class="row">
+            <label>Server Host</label>
+            <input id="serverHost" type="text" placeholder="127.0.0.1" />
+            <span class="help">HTTP bootstrap host</span>
           </div>
-          <small class="muted">Range 0.01–0.10 seconds (10–100 ms)</small>
-        </div>
-
-        <div class="grid">
-          <label>Axis Sign Flips</label>
-          <div class="flips">
-            <label class="row"><input type="checkbox" id="flipX"> X</label>
-            <label class="row"><input type="checkbox" id="flipY"> Y</label>
-            <label class="row"><input type="checkbox" id="flipZ"> Z</label>
-            <label class="row"><input type="checkbox" id="flipH"> H</label>
-            <label class="row"><input type="checkbox" id="flipP"> P</label>
-            <label class="row"><input type="checkbox" id="flipR"> R</label>
+          <div class="row">
+            <label>Server Port</label>
+            <input id="serverPort" type="number" min="1" max="65535" placeholder="3000" />
+            <span class="help">HTTP bootstrap port</span>
           </div>
-          <small class="muted mono">
-            X,Y,Z,P,R flip by multiplying with −1. H flip mirrors as (50 − H) to preserve 0..50 range.
-          </small>
-        </div>
-
-        <div class="grid">
-          <label class="grid">
-            <span>NKN Settings</span>
-            <small class="muted">You can also set via query: <code>?nknAddress=...&topicPrefix=...&uuid=...&metaUrl=...</code></small>
-            <input id="nknAddr" placeholder="sig.<64-hex>" />
-            <input id="nknPrefix" placeholder="roko-signaling" />
-            <input id="nknUUID" placeholder="target agent UUID (required for NKN)" />
-          </label>
-        </div>
-
-        <div class="row" style="justify-content:flex-end; gap:.5rem;">
-          <button type="button" onclick="document.getElementById('configDlg').hidden=true">Close</button>
-          <button type="submit" style="background:#0a84ff; border-color:#0a84ff;">Save &amp; Connect</button>
-        </div>
-      </form>
+          <div class="row" style="grid-column:1 / span 2">
+            <label>Agent UUID</label>
+            <input id="viewUuid" type="text" placeholder="agent-uuid" />
+          </div>
+          <div class="row">
+            <label>Show Depth</label>
+            <div><input id="showDepth" type="checkbox" /></div>
+          </div>
+          <div class="row">
+            <label>FPS Cap</label>
+            <input id="fpsCap" type="number" min="1" max="120" step="1" placeholder="30" />
+          </div>
+          <div class="row" style="grid-column:1 / span 2">
+            <label>Client Seed (hex, 64 chars) — optional</label>
+            <input id="clientSeed" type="text" placeholder="auto-generated & stored if empty" />
+            <span class="help">Persistent seed provides a stable NKN address.</span>
+          </div>
+          <div class="row" style="grid-column:1 / span 2">
+            <div class="err" id="formErr"></div>
+          </div>
+        </form>
+      </div>
+      <footer>
+        <button class="btn" id="cancelBtn">Cancel</button>
+        <button class="btn" id="saveBtn">Save & Start</button>
+      </footer>
     </div>
   </div>
 
-<script type="importmap">
-{
-  "imports": {
-    "three": "https://cdn.jsdelivr.net/npm/three@0.175.0/build/three.module.js"
-  }
-}
-</script>
+  <script>
+  ;(() => {
+    // ──────────────────────────────────────────────────────────────────────────
+    // Utilities
+    // ──────────────────────────────────────────────────────────────────────────
+    const $ = sel => document.querySelector(sel);
+    const $$ = sel => document.querySelectorAll(sel);
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const toHex = (buf) => Array.from(buf).map(b => b.toString(16).padStart(2,'0')).join('');
+    const fromB64 = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const looksLikeNknAddr = s => /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/.test((s||'').trim());
+    const now = () => performance.now() / 1000; // seconds
 
-<script type="module">
-import * as THREE from "three";
-import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.175.0/examples/jsm/controls/OrbitControls.js";
+    const LS = {
+      read() {
+        try { return JSON.parse(localStorage.getItem('nkn_viewer_cfg')||'{}'); }
+        catch { return {}; }
+      },
+      write(cfg) { localStorage.setItem('nkn_viewer_cfg', JSON.stringify(cfg)); }
+    };
 
-/* ------------------------------- Globals ---------------------------------- */
-const st = localStorage;
-const statusEl   = document.getElementById('status');
-const orientEl   = document.getElementById('orient');
-const cmdEl      = document.getElementById('cmd');
-const whichRobot = document.getElementById('whichRobot');
-
-const cfgDlg   = document.getElementById('configDlg');
-const srvInp   = document.getElementById('srv');
-const pwInp    = document.getElementById('pw');
-const nknAddrInp   = document.getElementById('nknAddr');
-const nknPrefixInp = document.getElementById('nknPrefix');
-const nknUUIDInp   = document.getElementById('nknUUID');
-
-const rateSlider = document.getElementById('rateSlider');
-const rateBox    = document.getElementById('rateBox');
-
-const btnPerms   = document.getElementById('btnPerms');
-const btnCenter  = document.getElementById('btnCenter');
-const btnSettings= document.getElementById('btnSettings');
-const btnHome    = document.getElementById('btnHome');
-
-const imgColor = document.getElementById('imgColor');
-const imgDepth = document.getElementById('imgDepth');
-const wrapColor = document.getElementById('wrapColor');
-const wrapDepth = document.getElementById('wrapDepth');
-let urlColor = null, urlDepth = null;
-
-const flipBoxes = {
-  X: document.getElementById('flipX'),
-  Y: document.getElementById('flipY'),
-  Z: document.getElementById('flipZ'),
-  H: document.getElementById('flipH'),
-  P: document.getElementById('flipP'),
-  R: document.getElementById('flipR'),
-};
-
-const SIO_PATH = "/socket.io";
-
-/* Control path: prefer NKN, fallback to WS if configured and NKN fails */
-let controlPath = 'nkn'; // 'nkn' | 'ws'
-
-let serverURL   = "";
-let sharedPW    = "";
-let jwtToken    = st.getItem('neck_jwt') || "";
-let socket      = null;
-
-let myUuid      = st.getItem('neck_my_uuid') || null;
-let targetUuid  = st.getItem('neck_target_uuid') || null;
-let subscribedUuid = null;
-
-/* NKN overlay state (server meta & client) */
-let nknClient = null;
-let nknAddress = st.getItem('neck_nkn_addr') || null;      // server sig address
-let nknTopicPrefix = st.getItem('neck_nkn_prefix') || null; // not required for DM flow but kept
-const NKN_DEFAULT_META_URL = "http://localhost:3000/";
-let nknMetaUrl = NKN_DEFAULT_META_URL;
-
-/* Orientation state */
-let yaw=0, pitch=0, roll=0;
-let baseQuat = null;
-let curQuat  = new THREE.Quaternion();
-
-/* Accel/transient */
-let accel = {x:0,y:0,z:0};
-let trans = {Y:0,Z:0,H:0};
-
-/* Streaming */
-let sendIntervalMs = Number(st.getItem('neck_rate_ms') || 100);
-let intervalTimer = null;
-let pauseUntil = 0;
-
-/* Flips */
-const flipsDefault = { X:1, Y:1, Z:1, H:1, P:1, R:1 };
-let flips = loadFlips();
-
-/* Tuning */
-const GAIN_YAW=8, GAIN_PITCH=8, GAIN_ROLL=8, DECAY=0.90;
-
-/* Helpers */
-const rad = THREE.MathUtils.degToRad;
-const deg = THREE.MathUtils.radToDeg;
-const clamp   = (v,min,max)=>Math.min(max,Math.max(min,v));
-const setStatus = (emoji)=>{ statusEl.textContent = emoji; };
-const now = ()=>Date.now();
-
-function loadFlips() { try { return Object.assign({}, flipsDefault, JSON.parse(st.getItem('neck_flips') || '{}')); } catch { return { ...flipsDefault }; } }
-function saveFlips() { st.setItem('neck_flips', JSON.stringify(flips)); }
-function populateFlipUI(){ for (const k of Object.keys(flipBoxes)) flipBoxes[k].checked = flips[k] === -1; }
-for (const k of Object.keys(flipBoxes)) flipBoxes[k].addEventListener('change', () => { flips[k] = flipBoxes[k].checked ? -1 : 1; saveFlips(); });
-
-/* ----------------------- iOS sensor permissions --------------------------- */
-async function requestSensorPermissions() {
-  try {
-    let p1 = (window.DeviceMotionEvent && typeof DeviceMotionEvent.requestPermission === 'function')
-      ? await DeviceMotionEvent.requestPermission() : 'granted';
-    let p2 = (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function')
-      ? await DeviceOrientationEvent.requestPermission() : 'granted';
-    if (p1 !== 'granted' || p2 !== 'granted') {
-      alert('Motion/orientation permissions were not granted. On iOS, use Safari over HTTPS.');
-      return false;
+    // Robust percentiles (for depth normalization)
+    function percentile(arr, p) {
+      if (!arr.length) return 0;
+      const idx = Math.min(arr.length - 1, Math.max(0, Math.floor((p/100)*arr.length)));
+      // nth_element style approximation to avoid full sort on every frame
+      // For simplicity here, we just sort on a copy (OK for moderate sizes).
+      const a = arr.slice().sort((x,y)=>x-y);
+      return a[idx];
     }
-    return true;
-  } catch { return true; }
-}
-btnPerms.addEventListener('click', async () => { const ok = await requestSensorPermissions(); if (ok) btnPerms.disabled = true; });
-if (!/iphone|ipad|ipod/i.test(navigator.userAgent)) btnPerms.disabled = true;
 
-/* ------------------------------ Settings/UI ------------------------------- */
-srvInp.value = st.getItem('neck_server') || "";
-pwInp.value  = st.getItem('neck_pw')     || "";
+    // ──────────────────────────────────────────────────────────────────────────
+    // App State
+    // ──────────────────────────────────────────────────────────────────────────
+    const state = {
+      serverSig: null,
+      topicPrefix: 'roko-signaling',
+      clientAddr: null,
+      client: null,
+      stats: { frames:0, bytes:0, t0: now(), fps:0, bps:0 },
+      fpsCap: 30,
+      uuid: '',
+      showDepth: false,
+      running: false
+    };
 
-nknAddrInp.value   = nknAddress || "";
-nknPrefixInp.value = nknTopicPrefix || "";
-nknUUIDInp.value   = targetUuid || "";
+    const ui = {
+      colorCanvas: $('#colorCanvas'),
+      depthCanvas: $('#depthCanvas'),
+      colorMeta: $('#colorMeta'),
+      depthMeta: $('#depthMeta'),
+      addrChip: $('#addrChip'),
+      topicChip: $('#topicChip'),
+      status: $('#status'),
+      depthView: $('#depthView'),
+    };
 
-rateSlider.value = String(sendIntervalMs);
-rateBox.value    = (sendIntervalMs/1000).toFixed(2);
-populateFlipUI();
+    const ctxColor = ui.colorCanvas.getContext('2d');
+    const ctxDepth = ui.depthCanvas.getContext('2d');
 
-document.getElementById('cfgForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  st.setItem('neck_server', srvInp.value.trim());
-  st.setItem('neck_pw',     pwInp.value.trim());
-  st.setItem('neck_rate_ms', String(sendIntervalMs));
+    // ──────────────────────────────────────────────────────────────────────────
+    // Modal
+    // ──────────────────────────────────────────────────────────────────────────
+    const modal = {
+      backdrop: $('#modalBackdrop'),
+      open() { this.backdrop.style.display = 'flex'; },
+      close() { this.backdrop.style.display = 'none'; },
+      fillFromLS() {
+        const cfg = LS.read();
+        $('#serverHost').value = cfg.serverHost || '127.0.0.1';
+        $('#serverPort').value = cfg.serverPort || 3000;
+        $('#viewUuid').value   = cfg.viewUuid   || '';
+        $('#showDepth').checked= !!cfg.showDepth;
+        $('#fpsCap').value     = cfg.fpsCap || 30;
+        $('#clientSeed').value = cfg.clientSeed || '';
+      },
+      grab() {
+        const serverHost = $('#serverHost').value.trim();
+        const serverPort = parseInt($('#serverPort').value, 10) || 3000;
+        const viewUuid   = $('#viewUuid').value.trim();
+        const showDepth  = $('#showDepth').checked;
+        const fpsCap     = Math.max(1, Math.min(120, parseInt($('#fpsCap').value, 10) || 30));
+        let clientSeed   = $('#clientSeed').value.trim().toLowerCase().replace(/^0x/,'');
+        if (clientSeed && !/^[0-9a-f]{64}$/.test(clientSeed)) {
+          throw new Error('Client seed must be 64 hex chars (32 bytes).');
+        }
+        return { serverHost, serverPort, viewUuid, showDepth, fpsCap, clientSeed };
+      },
+      save(cfg) {
+        LS.write(cfg);
+      }
+    };
 
-  // NKN overrides saved
-  nknAddress = nknAddrInp.value.trim() || null;
-  nknTopicPrefix = nknPrefixInp.value.trim() || null;
-  targetUuid = nknUUIDInp.value.trim() || targetUuid;
-  if (nknAddress) st.setItem('neck_nkn_addr', nknAddress); else st.removeItem('neck_nkn_addr');
-  if (nknTopicPrefix) st.setItem('neck_nkn_prefix', nknTopicPrefix); else st.removeItem('neck_nkn_prefix');
-  if (targetUuid) { st.setItem('neck_target_uuid', targetUuid); } else { st.removeItem('neck_target_uuid'); }
+    // Buttons
+    $('#openSettings').addEventListener('click', () => {
+      modal.fillFromLS();
+      modal.open();
+    });
+    $('#cancelBtn').addEventListener('click', () => modal.close());
+    $('#saveBtn').addEventListener('click', async () => {
+      const err = $('#formErr'); err.textContent = '';
+      try {
+        const cfg = modal.grab();
+        modal.save(cfg);
+        modal.close();
+        await restart();
+      } catch (e) {
+        err.textContent = e.message || String(e);
+      }
+    });
+    $('#restartBtn').addEventListener('click', () => restart());
 
-  saveFlips();
-  cfgDlg.hidden = true;
-  await boot();  // connect after saving
-});
-btnSettings.addEventListener('click', () => { cfgDlg.hidden = false; });
-
-rateSlider.addEventListener('input', () => {
-  sendIntervalMs = parseInt(rateSlider.value, 10);
-  rateBox.value = (sendIntervalMs/1000).toFixed(2);
-  st.setItem('neck_rate_ms', String(sendIntervalMs));
-  scheduleTick();
-});
-rateBox.addEventListener('change', () => {
-  let s = parseFloat(rateBox.value);
-  if (Number.isNaN(s)) return;
-  s = clamp(s, 0.01, 0.10);
-  sendIntervalMs = Math.round(s * 1000);
-  rateSlider.value = String(sendIntervalMs);
-  st.setItem('neck_rate_ms', String(sendIntervalMs));
-  scheduleTick();
-});
-
-/* ----------------- Orientation → quaternion / Three.js -------------------- */
-const corrQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2);
-function deviceToQuat(alpha, beta, gamma) {
-  const e = new THREE.Euler(rad(beta), rad(alpha), -rad(gamma), 'YXZ');
-  const q = new THREE.Quaternion().setFromEuler(e);
-  q.multiply(corrQuat);
-  return q;
-}
-
-// Scene
-const poseCanvas = document.getElementById('poseCanvas');
-const renderer = new THREE.WebGLRenderer({ canvas: poseCanvas, antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0a0a0a);
-const cam = new THREE.PerspectiveCamera(55, 16/9, 0.1, 50);
-cam.position.set(0, 0, 5);
-scene.add(cam);
-
-const controls = new OrbitControls(cam, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.08;
-controls.target.set(0, 0, 0);
-controls.update();
-
-const light = new THREE.HemisphereLight(0xffffff, 0x222222, 1.0);
-scene.add(light);
-const dir = new THREE.DirectionalLight(0xffffff, 0.3);
-dir.position.set(1,1,1);
-scene.add(dir);
-
-// Phone slab
-const phoneGeom = new THREE.BoxGeometry(0.7, 1.4, 0.05);
-const phoneMat  = new THREE.MeshBasicMaterial({ color: 0x111111, wireframe: true, transparent: true, opacity: 0.1 });
-const phoneMesh = new THREE.Mesh(phoneGeom, phoneMat);
-phoneMesh.position.set(0, -0.5, 0.15);
-scene.add(phoneMesh);
-
-// Grid
-const grid = new THREE.GridHelper(10, 10, 0x333333, 0x222222);
-grid.position.y = -1;
-scene.add(grid);
-
-// Depth mesh infra
-let depthCanvas = document.createElement('canvas');
-let depthCtx = depthCanvas.getContext('2d', { willReadFrequently: true });
-
-let colorTex = new THREE.Texture();
-colorTex.colorSpace = THREE.SRGBColorSpace;
-colorTex.minFilter = THREE.LinearFilter;
-colorTex.magFilter = THREE.LinearFilter;
-colorTex.wrapS = colorTex.wrapT = THREE.ClampToEdgeWrapping;
-colorTex.flipY = true;
-
-let depthMesh = null;
-let depthGeom = null;
-let posAttr = null;
-let posArr = null;
-let gridW = 0, gridH = 0;
-let srcW = 0, srcH = 0;
-const DIV = 3;
-let depthScale = 1.5;
-
-function ensureDepthGeometry(w, h) {
-  if (depthMesh && w === srcW && h === srcH) return;
-  if (depthMesh) {
-    scene.remove(depthMesh);
-    depthMesh.geometry.dispose();
-    depthMesh.material.dispose();
-  }
-  srcW = w; srcH = h;
-  depthCanvas.width = srcW; depthCanvas.height = srcH;
-  const WORLD_H = 3;
-  const WORLD_W = WORLD_H * (srcW / srcH);
-  gridW = Math.max(2, Math.round(srcW / DIV));
-  gridH = Math.max(2, Math.round(srcH / DIV));
-  depthGeom = new THREE.PlaneGeometry(WORLD_W, WORLD_H, gridW - 1, gridH - 1);
-  const uv = depthGeom.getAttribute('uv');
-  for (let i = 0; i < uv.count; i++) uv.setY(i, 1 - uv.getY(i));
-  uv.needsUpdate = true;
-  posAttr = depthGeom.getAttribute('position');
-  posArr  = posAttr.array;
-  const mat = new THREE.MeshBasicMaterial({ map: colorTex, side: THREE.DoubleSide });
-  depthMesh = new THREE.Mesh(depthGeom, mat);
-  scene.add(depthMesh);
-}
-function resizePose() {
-  const rect = poseCanvas.parentElement.getBoundingClientRect();
-  const w = Math.max(300, rect.width);
-  const h = Math.max(240, rect.height - 24);
-  renderer.setSize(w, h, false);
-  cam.aspect = w / h;
-  cam.updateProjectionMatrix();
-}
-window.addEventListener('resize', resizePose);
-resizePose();
-function renderLoop() { controls.update(); renderer.render(scene, cam); requestAnimationFrame(renderLoop); }
-renderLoop();
-
-window.addEventListener('deviceorientation', e => {
-  if (e.alpha == null) return;
-  yaw   = e.alpha;
-  pitch = e.beta;
-  roll  = e.gamma;
-  curQuat.copy(deviceToQuat(yaw, pitch, roll));
-  phoneMesh.setRotationFromQuaternion(curQuat);
-  if (orientEl) orientEl.textContent = `Yaw ${yaw.toFixed(0)}°  Pitch ${pitch.toFixed(0)}°  Roll ${roll.toFixed(0)}°`;
-}, true);
-
-window.addEventListener('devicemotion', e => {
-  let a = e.acceleration && (e.acceleration.x!=null) ? e.acceleration : e.accelerationIncludingGravity;
-  if (a) accel = { x: a.x || 0, y: a.y || 0, z: a.z || 0 };
-}, true);
-
-btnCenter.addEventListener('click', () => { baseQuat = curQuat.clone(); });
-
-/* ---------------------------- HOME button ---------------------------------- */
-btnHome.addEventListener('click', () => {
-  trans = {Y:0,Z:0,H:0};
-  if (cmdEl) cmdEl.textContent = "HOME";
-  if (controlPath === 'nkn') sendControlNKN("HOME");
-  else if (socket && socket.connected) socket.emit('broadcast-message', { message: "HOME" });
-  pauseUntil = now() + 5000;
-});
-
-/* ----------------------------- Command gen --------------------------------- */
-function getRelativeYPRDeg() {
-  if (!baseQuat) return { yaw:0, pitch:0, roll:0 };
-  const invBase = baseQuat.clone().invert();
-  const rel = invBase.multiply(curQuat);
-  const e = new THREE.Euler().setFromQuaternion(rel, 'YXZ');
-  return { yaw: deg(e.y), pitch: deg(e.x), roll: deg(e.z) };
-}
-function decay(v){ return Math.abs(v) < 1 ? 0 : v*DECAY; }
-function tick() {
-  if (now() < pauseUntil) return;
-
-  trans.Z = clamp(decay(trans.Z + (-accel.y*10)), -400, 400);
-  trans.H = clamp(decay(trans.H + ( accel.z* 2)),   20,  50);
-  trans.Y = clamp(decay(trans.Y + ( accel.x*10)), -400, 400);
-
-  const { yaw: yDeg, pitch: pDeg, roll: rDeg } = getRelativeYPRDeg();
-  const X = clamp(-yDeg * GAIN_YAW,   -400, 400);
-  const P = clamp( pDeg * GAIN_PITCH, -400, 400);
-  const R = clamp( rDeg * GAIN_ROLL,  -400, 400);
-
-  const Xo = flips.X * X;
-  const Yo = flips.Y * trans.Y;
-  const Zo = flips.Z * trans.Z;
-  let   Ho = trans.H;
-  if (flips.H === -1) Ho = 50 - Ho;
-  Ho = clamp(Ho, 0, 50);
-  const Po = flips.P * P;
-  const Ro = flips.R * R;
-
-  const cmd = `X${Xo.toFixed(0)},Y${Yo.toFixed(0)},Z${Zo.toFixed(0)},H${Ho.toFixed(0)},S1,A1,R${Ro.toFixed(0)},P${Po.toFixed(0)}`;
-  if (cmdEl) cmdEl.textContent = cmd;
-
-  if (controlPath === 'nkn') {
-    sendControlNKN(cmd);
-  } else if (socket && socket.connected) {
-    socket.emit('broadcast-message', { message: cmd });
-  }
-}
-function scheduleTick() { if (intervalTimer) clearInterval(intervalTimer); intervalTimer = setInterval(tick, sendIntervalMs); }
-scheduleTick();
-
-/* ----------------------- Frames (UI + Three.js) ---------------------------- */
-function blobFromPayload(payload, mime) {
-  if (payload instanceof Blob) return payload;
-  if (typeof payload === 'string') {
-    if (payload.startsWith('data:')) {
-      const comma = payload.indexOf(',');
-      const meta = payload.substring(5, comma); // e.g., image/png;base64
-      const data = payload.substring(comma + 1);
-      const isB64 = /;base64/i.test(meta);
-      const contentType = meta.split(';')[0];
-      const bytes = isB64 ? Uint8Array.from(atob(data), c => c.charCodeAt(0)) : new TextEncoder().encode(data);
-      return new Blob([bytes], { type: contentType || mime });
-    } else {
-      const bytes = Uint8Array.from(atob(payload), c => c.charCodeAt(0));
-      return new Blob([bytes], { type: mime });
+    // ──────────────────────────────────────────────────────────────────────────
+    // Bootstrap: fetch server sig/topic from local HTTP endpoint
+    // ──────────────────────────────────────────────────────────────────────────
+    async function fetchBootstrap(host, port) {
+      const url = `http://${host}:${port}/`;
+      ui.status.textContent = `bootstrapping from ${url} …`;
+      try {
+        const r = await fetch(url, { method:'GET' });
+        const data = await r.json();
+        if (data && data.ok && typeof data.nknAddress === 'string') {
+          return {
+            SERVER_SIG: data.nknAddress,
+            TOPIC_PREFIX: data.topicPrefix || 'roko-signaling'
+          };
+        }
+      } catch (e) {
+        console.warn('bootstrap failed', e);
+      }
+      return null;
     }
-  }
-  try { return new Blob([payload], { type: mime }); }
-  catch { return new Blob([], { type: mime }); }
-}
 
-async function updateColorTextureFromBlob(blob) {
-  try {
-    const bmp = await createImageBitmap(blob, { imageOrientation: 'none' });
-    ensureDepthGeometry(bmp.width, bmp.height);
-    colorTex.image = bmp;
-    colorTex.needsUpdate = true;
-  } catch {}
-}
-async function updateDepthFromBlob(blob) {
-  try {
-    const bmp = await createImageBitmap(blob, { imageOrientation: 'none' });
-    ensureDepthGeometry(bmp.width, bmp.height);
-    depthCtx.drawImage(bmp, 0, 0, srcW, srcH);
-    const id = depthCtx.getImageData(0, 0, srcW, srcH);
-    const data = id.data;
-    if (!posAttr) return;
-    for (let gy = 0; gy < gridH; gy++) {
-      const sy = Math.min(srcH - 1, Math.round(gy * (srcH - 1) / (gridH - 1)));
-      for (let gx = 0; gx < gridW; gx++) {
-        const sx = Math.min(srcW - 1, Math.round(gx * (srcW - 1) / (gridW - 1)));
-        const p = (sy * srcW + sx) * 4;
-        const lum = data[p];
-        const z = (lum / 255) * depthScale;
-        const i = (gy * gridW + gx) * 3 + 2;
-        posArr[i] = z;
+    // ──────────────────────────────────────────────────────────────────────────
+    // NKN client (browser) — MultiClient
+    // ──────────────────────────────────────────────────────────────────────────
+    function getOrCreateSeedHex(userSeed) {
+      if (userSeed) return userSeed;
+      let hex = localStorage.getItem('CLIENT_NKN_SEED_HEX');
+      if (/^[0-9a-f]{64}$/.test(hex||'')) return hex;
+      const arr = new Uint8Array(32);
+      (crypto || window.msCrypto).getRandomValues(arr);
+      hex = toHex(arr);
+      localStorage.setItem('CLIENT_NKN_SEED_HEX', hex);
+      return hex;
+    }
+
+    function normalizeInbound(a, b) {
+      // Matches the Python bridge logic: support (src,payload) or object forms
+      if (a && typeof a === 'object' && (a.payload !== undefined || a.data !== undefined || a.src !== undefined || a.from !== undefined)) {
+        const src = a.src || a.from || a.addr || '';
+        const payload = (a.payload !== undefined) ? a.payload : a.data;
+        return { src, payload };
+      }
+      return { src: a, payload: b };
+    }
+
+    function payloadToString(payload) {
+      if (payload == null) return '';
+      try {
+        if (payload instanceof Uint8Array) return new TextDecoder().decode(payload);
+        if (typeof payload === 'string') return payload;
+        if (typeof payload === 'object') return JSON.stringify(payload);
+        return String(payload);
+      } catch { return ''; }
+    }
+
+    async function startClient({ seedHex, identifier='viewer' }) {
+      // For browser usage, nkn-sdk exposes global "nkn" with Client and MultiClient; use MultiClient for reliability. (CDN dist) :contentReference[oaicite:1]{index=1}
+      const client = new nkn.MultiClient({ seed: seedHex, identifier });
+      ui.status.textContent = 'connecting to NKN …';
+      client.onConnect(() => {
+        ui.status.textContent = 'NKN ready';
+        state.clientAddr = client.addr;
+        ui.addrChip.textContent = `addr: ${client.addr}`;
+        // Immediately announce as viewer
+        if (looksLikeNknAddr(state.serverSig)) {
+          client.send(state.serverSig, JSON.stringify({ event:'viewer-hello', uuid: state.uuid }));
+        }
+      });
+
+      // message event: API forwards either (src, payload) or a single object
+      client.on('message', (a, b) => {
+        try {
+          const { src, payload } = normalizeInbound(a, b);
+          const txt = payloadToString(payload);
+          let body = {};
+          try { body = JSON.parse(txt); } catch { body = { raw: txt }; }
+          handleInbound(src, body);
+        } catch (e) {
+          console.warn('bad inbound', e);
+        }
+      });
+
+      window.addEventListener('beforeunload', () => {
+        try { client.send(state.serverSig, JSON.stringify({ event:'viewer-bye', uuid: state.uuid })); } catch {}
+      });
+
+      return client;
+    }
+
+    function updateStats(nbytes) {
+      const t = now();
+      state.stats.frames += 1;
+      state.stats.bytes  += nbytes;
+      const dt = t - state.stats.t0;
+      if (dt >= 1.0) {
+        state.stats.fps = state.stats.frames / dt;
+        state.stats.bps = state.stats.bytes / dt;
+        state.stats.frames = 0;
+        state.stats.bytes  = 0;
+        state.stats.t0 = t;
       }
     }
-    posAttr.needsUpdate = true;
-  } catch {}
-}
-function updateImg(imgEl, wrapEl, oldUrlRefName, payload, mime) {
-  const blob = blobFromPayload(payload, mime);
-  const url = URL.createObjectURL(blob);
-  const tmp = new Image();
-  tmp.onload = () => { wrapEl.style.aspectRatio = `${tmp.naturalWidth} / ${tmp.naturalHeight}`; URL.revokeObjectURL(tmp.src); };
-  tmp.src = url;
-  imgEl.src = url;
-  if (imgEl === imgColor) updateColorTextureFromBlob(blob);
-  else if (imgEl === imgDepth) updateDepthFromBlob(blob);
-  if (window[oldUrlRefName]) URL.revokeObjectURL(window[oldUrlRefName]);
-  window[oldUrlRefName] = url;
-}
 
-/* ----------------------- Optional Socket.IO ------------------------------- */
-function wireCommonHandlers(s) {
-  s.on('connect',      () => setStatus('🟢'));
-  s.on('disconnect',   () => { if (controlPath === 'ws') setStatus('🔴'); });
-  s.on('connect_error',() => { if (controlPath === 'ws') setStatus('🔴'); });
-}
-function connectWS_withToken() {
-  return new Promise((resolve,reject)=>{
-    const s = io(serverURL, { path: SIO_PATH, auth: { token: jwtToken }, transports: ['websocket'] });
-    let settled = false;
-    wireCommonHandlers(s);
-    s.on('connect', () => { socket = s; settled = true; resolve('token'); });
-    s.on('connect_error',(err) => { if (!settled) { s.close(); reject(err); } });
-  });
-}
-function connectWS_withPassword() {
-  return new Promise((resolve,reject)=>{
-    const uuid = 'phone-' + Date.now().toString(36);
-    myUuid = uuid; st.setItem('neck_my_uuid', myUuid);
-    const s = io(serverURL, { path: SIO_PATH, auth: { uuid, password: sharedPW }, transports: ['websocket'] });
-    let settled = false;
-    wireCommonHandlers(s);
-    s.on('connect', () => { socket = s; settled = true; resolve('password'); });
-    s.on('connect_error',(err) => { if (!settled) { s.close(); reject(err); } });
-  });
-}
+    // ──────────────────────────────────────────────────────────────────────────
+    // Frame handling
+    // ──────────────────────────────────────────────────────────────────────────
+    const latest = {
+      color: { img: null, ts: 0, bytes: 0 },
+      depth: { data: null, ts: 0, bytes: 0, isImage: true } // if not image, raw u16
+    };
 
-/* ------------------------------ NKN Client --------------------------------- */
-function readQueryOverrides() {
-  const q = new URLSearchParams(location.search);
-  if (q.get("nknAddress")) nknAddress = q.get("nknAddress");
-  if (q.get("topicPrefix")) nknTopicPrefix = q.get("topicPrefix");
-  if (q.get("uuid")) { targetUuid = q.get("uuid"); st.setItem('neck_target_uuid', targetUuid); }
-  if (q.get("metaUrl")) nknMetaUrl = q.get("metaUrl");
-}
+    function handleInbound(src, body) {
+      const ev = body && body.event;
+      if (!ev) return;
 
-async function fetchNKNMetaIfNeeded() {
-  // Prefer explicit overrides; otherwise fetch from server meta (if given)
-  if (!nknAddress || !nknTopicPrefix) {
-    const base = (serverURL || nknMetaUrl || NKN_DEFAULT_META_URL).replace(/\/+$/,'') + "/";
-    try {
-      const meta = await fetch(base, { cache: "no-store" }).then(r => r.json());
-      nknAddress     = nknAddress     || meta.nknAddress || null;
-      nknTopicPrefix = nknTopicPrefix || meta.topicPrefix || null;
-    } catch (e) {
-      console.warn("[NKN] Failed to fetch meta from", base, e);
+      if (ev === 'viewer-ack') {
+        ui.status.textContent = `viewer-ack from server (uuid=${state.uuid})`;
+        return;
+      }
+
+      if (ev === 'frame-color' && body.uuid === state.uuid && typeof body.data === 'string') {
+        const b64 = body.data;
+        // draw via Image bitmap for speed
+        latest.color.img = b64;
+        latest.color.ts  = performance.now();
+        latest.color.bytes = Math.floor(b64.length * 3 / 4);
+        updateStats(latest.color.bytes);
+        return;
+      }
+
+      if (ev === 'frame-depth' && state.showDepth && body.uuid === state.uuid && typeof body.data === 'string') {
+        const b64 = body.data;
+        // try as image first (PNG/WEBP/etc)
+        latest.depth.data = b64;
+        latest.depth.ts   = performance.now();
+        latest.depth.bytes= Math.floor(b64.length * 3 / 4);
+        latest.depth.isImage = true;
+        updateStats(latest.depth.bytes);
+        // If you also support raw u16 square payloads, uncomment decode path on draw.
+        return;
+      }
     }
-  }
-  nknAddrInp.value = nknAddress || "";
-  nknPrefixInp.value = nknTopicPrefix || "";
-  if (targetUuid) nknUUIDInp.value = targetUuid;
-}
 
-async function ensureNKNClient() {
-  if (nknClient) return nknClient;
-  nknClient = new window.nkn.MultiClient({ identifier: "web" });
-  await new Promise(res => nknClient.on("connect", res));
-  console.log("[NKN] connected:", nknClient.addr);
+    async function drawLoop() {
+      const frameInterval = Math.max(1.0 / state.fpsCap, 1.0 / 60.0); // seconds
+      let last = 0;
+      const draw = async (tMs) => {
+        const t = tMs / 1000;
+        if (!state.running) return;
 
-  // Receive server DMs (frames, acks, etc.)
-  nknClient.on("message", (src, payload) => {
-    let text;
-    if (typeof payload === "string") text = payload;
-    else { try { text = new TextDecoder().decode(payload); } catch { return; } }
-    let msg; try { msg = JSON.parse(text); } catch { return; }
+        if (t - last >= frameInterval) {
+          last = t;
+          // COLOR
+          if (latest.color.img) {
+            await drawImageB64ToCanvas(latest.color.img, ui.colorCanvas, ctxColor, overlayText('COLOR'));
+          }
+          // DEPTH
+          if (state.showDepth && latest.depth.data) {
+            if (latest.depth.isImage) {
+              await drawImageB64ToCanvas(latest.depth.data, ui.depthCanvas, ctxDepth, overlayText('DEPTH'));
+            } else {
+              // (Optional path for raw u16 if you enable it)
+            }
+          }
 
-    // lightweight acks
-    if (msg.event === "viewer-ack" || msg.event === "control-ack" || msg.event === "control-error") {
-      return;
+          // overlay metas
+          ui.colorMeta.textContent = metaLine();
+          if (state.showDepth) ui.depthMeta.textContent = metaLine();
+        }
+
+        requestAnimationFrame(draw);
+      };
+      requestAnimationFrame(draw);
     }
-    if (!msg || msg.uuid !== subscribedUuid) return;
 
-    if (msg.event === "frame-color") {
-      updateImg(imgColor, wrapColor, 'urlColor', msg.data, 'image/jpeg');
-    } else if (msg.event === "frame-depth") {
-      updateImg(imgDepth, wrapDepth, 'urlDepth', msg.data, 'image/png');
-    } else if (msg.event === "peer-message") {
-      // optional: console.log("[NKN] peer-message", msg.data);
+    function metaLine() {
+      const Mbps = (state.stats.bps * 8 / 1e6).toFixed(2);
+      return `uuid=${state.uuid} • fps=${state.stats.fps.toFixed(1)} • rate=${Mbps} Mbps`;
     }
-  });
 
-  return nknClient;
-}
-
-async function nknWatchUUID(uuid) {
-  await fetchNKNMetaIfNeeded();
-  const client = await ensureNKNClient();
-  if (!uuid) {
-    console.warn("[NKN] No target UUID. Set it in Settings.");
-    return;
-  }
-  if (!nknAddress) {
-    console.warn("[NKN] Missing server sig address; set it in Settings.");
-    return;
-  }
-  try {
-    await client.send(nknAddress, JSON.stringify({ event:"viewer-hello", uuid, from: client.addr, at: Date.now() }));
-    console.log("[NKN] viewer-hello sent for uuid", uuid);
-  } catch (e) {
-    console.error("[NKN] failed to send viewer-hello:", e);
-  }
-}
-
-async function sendControlNKN(cmd) {
-  if (!subscribedUuid) return;
-  await fetchNKNMetaIfNeeded();
-  if (!nknAddress) return;
-  const client = await ensureNKNClient();
-  try {
-    await client.send(nknAddress, JSON.stringify({
-      event: "control",
-      uuid: subscribedUuid,
-      command: cmd
-    }));
-  } catch (e) {
-    console.error("[NKN] control send failed:", e);
-  }
-}
-
-/* ------------------------------ Boot flow ---------------------------------- */
-async function boot() {
-  readQueryOverrides();
-  serverURL = (st.getItem('neck_server') || "").trim().replace(/\/+$/, '');
-  sharedPW  = (st.getItem('neck_pw')     || "").trim();
-
-  setStatus('🟡');
-
-  // NKN first
-  try {
-    await fetchNKNMetaIfNeeded();
-    await ensureNKNClient();
-    controlPath = 'nkn';
-    console.log("[Boot] Control path: NKN");
-  } catch (e) {
-    console.warn("[Boot] NKN unavailable, will try WS fallback:", e);
-  }
-
-  // Optional WS fallback if configured
-  if (controlPath !== 'nkn' && serverURL && sharedPW) {
-    try {
-      if (jwtToken) await connectWS_withToken();
-      else          await connectWS_withPassword();
-      controlPath = 'ws';
-      setStatus('🟢');
-      console.log("[Boot] Control path: WS");
-    } catch (ee) {
-      console.error('[Boot] WS connect failed:', ee);
-      setStatus('🔴');
+    function overlayText(tag) {
+      return tag;
     }
-  } else {
-    setStatus('🟢'); // NKN good
-  }
 
-  // Choose/view target UUID
-  if (!targetUuid) {
-    // If not set, leave dialog open. For NKN we need the uuid explicitly.
-    cfgDlg.hidden = false;
-    return;
-  }
-  subscribedUuid = targetUuid;
-  whichRobot && (whichRobot.textContent = `robot: ${targetUuid}`);
-  // Tell server to DM frames for this uuid
-  nknWatchUUID(targetUuid);
+    async function drawImageB64ToCanvas(b64, canvas, ctx, label) {
+      const blob = b64toBlob(b64);
+      const bmp = await createImageBitmap(blob);
+      // Resize canvas to bitmap dimensions on first draw
+      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+        canvas.width = bmp.width; canvas.height = bmp.height;
+      }
+      ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
 
-  // Auto-baseline once after 1s
-  setTimeout(() => { if (!baseQuat) baseQuat = curQuat.clone(); }, 1000);
-}
+      // Top overlay bar (semi-transparent)
+      ctx.save();
+      ctx.globalAlpha = 0.4;
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, 42);
+      ctx.restore();
+      ctx.font = '16px system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Arial';
+      ctx.fillStyle = '#fff';
+      ctx.fillText(metaLine(), 12, 26);
+    }
 
-/* ------------------------------ First-load --------------------------------- */
-document.getElementById('cfgForm').reportValidity(); // hint required fields if any
-if (!(st.getItem('neck_server') && st.getItem('neck_pw'))) {
-  // Still okay; NKN will run without WS. We just need uuid+sig in settings.
-}
-cfgDlg.hidden = false; // encourage filling NKN/uuid at first run
-boot().catch(err => console.error(err));
-</script>
+    function b64toBlob(b64) {
+      const bin = fromB64(b64);
+      return new Blob([bin], { type: 'image/*' });
+    }
 
+    // Optional: raw u16 depth normalization (if you decide to send raw)
+    function normalizeDepthU16ToRGBA(u16arr) {
+      // Calculate percentiles
+      const len = u16arr.length;
+      // Sample for speed if very large
+      const step = Math.max(1, Math.floor(len / 10000));
+      const sample = [];
+      for (let i=0; i<len; i+=step) sample.push(u16arr[i]);
+      const p5  = percentile(sample, 5);
+      const p95 = Math.max(p5+1, percentile(sample, 95));
+      const rgba = new Uint8ClampedArray(len * 4);
+      for (let i=0;i<len;i++){
+        const v = Math.min(1, Math.max(0, (u16arr[i]-p5)/(p95-p5)));
+        const val = Math.round(v * 255);
+        rgba[i*4+0] = val; // grayscale -> COLORMAP could be added here
+        rgba[i*4+1] = val;
+        rgba[i*4+2] = 255 - val;
+        rgba[i*4+3] = 255;
+      }
+      return rgba;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Lifecycle
+    // ──────────────────────────────────────────────────────────────────────────
+    async function restart() {
+      // Read config
+      const cfg = LS.read();
+      state.uuid = cfg.viewUuid || '';
+      state.showDepth = !!cfg.showDepth;
+      state.fpsCap = cfg.fpsCap || 30;
+      ui.depthView.style.display = state.showDepth ? '' : 'none';
+
+      if (!cfg.serverHost || !cfg.serverPort || !state.uuid) {
+        modal.fillFromLS();
+        modal.open();
+        return;
+      }
+
+      // Bootstrap
+      const boot = await fetchBootstrap(cfg.serverHost, cfg.serverPort);
+      if (!boot) {
+        ui.status.textContent = 'Bootstrap failed. Open Settings and verify host/port.';
+        return;
+      }
+      state.serverSig = boot.SERVER_SIG;
+      state.topicPrefix = boot.TOPIC_PREFIX;
+      ui.topicChip.textContent = `topic: ${state.topicPrefix}`;
+      if (!looksLikeNknAddr(state.serverSig)) {
+        ui.status.textContent = `Invalid NKN destination: ${state.serverSig}`;
+        return;
+      }
+
+      // Create persistent seed
+      const seedHex = getOrCreateSeedHex(cfg.clientSeed);
+      if (cfg.clientSeed && cfg.clientSeed !== seedHex) {
+        localStorage.setItem('CLIENT_NKN_SEED_HEX', cfg.clientSeed); // honor user provided override
+      }
+
+      // Stop existing client if any
+      if (state.client && state.client.close) {
+        try { state.client.close(); } catch {}
+      }
+
+      // Start NKN
+      state.client = await startClient({ seedHex });
+      state.running = true;
+
+      // Soft wait for readiness
+      for (let i=0;i<400;i++) {
+        if (state.clientAddr) break;
+        await sleep(25);
+      }
+      if (!state.clientAddr) {
+        ui.status.textContent = 'NKN client did not become ready.';
+        state.running = false;
+        return;
+      }
+
+      ui.status.textContent = 'Viewer running. Press Settings to change params.';
+      drawLoop();
+    }
+
+    // First time: open settings if missing
+    (function init() {
+      const cfg = LS.read();
+      if (!cfg.serverHost || !cfg.serverPort || !cfg.viewUuid) {
+        modal.fillFromLS();
+        modal.open();
+      } else {
+        restart();
+      }
+    })();
+
+  })();
+  </script>
 </body>
 </html>
