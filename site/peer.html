@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>NKN Viewer (Browser) + Chat</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js"></script>
+  <style>
+    :root {
+      --bg:#0b0f14; --fg:#ecf2f8; --muted:#9fb3c8; --accent:#4dd0ff; --danger:#ff5c5c;
+      --panel:#121821; --panel2:#1a2230; --overlay:rgba(0,0,0,.55);
+    }
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif}
+    header{padding:10px 14px;background:var(--panel);border-bottom:1px solid #0e141c;display:flex;gap:12px;align-items:center}
+    header h1{font-size:14px;margin:0;font-weight:600;letter-spacing:.5px}
+    header .chip{padding:4px 8px;border-radius:999px;background:var(--panel2);color:var(--muted)}
+    main{display:grid;grid-template-columns:1fr 1fr 360px;gap:10px;padding:12px;height:calc(100% - 54px);box-sizing:border-box}
+    .view{position:relative;border:1px solid #0e141c;border-radius:8px;overflow:hidden;background:#000;min-height:200px}
+    .view canvas,.view img{width:100%;height:100%;display:block;object-fit:contain;background:#000}
+    .overlay{position:absolute;left:0;top:0;right:0;height:40px;background:linear-gradient(180deg,rgba(0,0,0,.6),rgba(0,0,0,0));display:flex;align-items:center;gap:12px;padding:8px 10px;box-sizing:border-box;pointer-events:none;font-size:12px}
+    .overlay .tag{background:rgba(255,255,255,.12);padding:3px 8px;border-radius:999px}
+    .bar{display:flex;gap:8px;align-items:center;margin-left:auto}
+    .btn{background:var(--panel2);border:1px solid #1f2a3a;color:var(--fg);padding:8px 12px;border-radius:6px;cursor:pointer}
+    .btn:hover{filter:brightness(1.15)}
+    .muted{color:var(--muted)}
+    .statusline{padding:0 12px;color:var(--muted)}
+    /* Modal */
+    .modal-backdrop{position:fixed;inset:0;background:var(--overlay);display:none;align-items:center;justify-content:center;z-index:1000}
+    .modal{width:min(640px,92vw);background:var(--panel);border:1px solid #1b2533;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+    .modal header{background:transparent;border:0;padding:14px 16px}
+    .modal h2{margin:0;font-size:16px}
+    .modal .content{padding:0 16px 16px 16px}
+    .form{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .form .row{display:flex;flex-direction:column;gap:6px}
+    .form label{font-size:12px;color:var(--muted)}
+    .form input[type="text"],.form input[type="number"]{background:#0f1520;border:1px solid #1f2a3a;color:var(--fg);border-radius:6px;padding:8px 10px;outline:none}
+    .form input[type="checkbox"]{transform:scale(1.1)}
+    .form .row span.help{font-size:11px;color:var(--muted)}
+    .modal footer{display:flex;gap:10px;padding:12px 16px 16px;justify-content:flex-end}
+    .err{color:var(--danger);font-size:12px;margin-top:6px;min-height:1em}
+    .hidden{display:none!important}
+    /* Chat pane */
+    #chatView{display:flex;flex-direction:column;background:var(--panel)}
+    .chatwrap{display:flex;flex-direction:column;height:100%}
+    #chatLog{flex:1;overflow:auto;padding:10px;background:#0d131c}
+    .msg{margin:6px 0;max-width:92%}
+    .msg .who{font-size:11px;color:var(--muted);margin-bottom:2px}
+    .msg .bubble{background:#0f1722;border:1px solid #1f2a3a;border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-word}
+    .msg.me .bubble{background:#152036;border-color:#243144}
+    .chatInput{display:flex;gap:8px;padding:10px;border-top:1px solid #0e141c;background:#0f1520}
+    .chatInput input{flex:1;background:#0f1520;border:1px solid #1f2a3a;color:var(--fg);border-radius:6px;padding:8px 10px;outline:none}
+    .chatInput select{background:#0f1520;border:1px solid #1f2a3a;color:var(--fg);border-radius:6px;padding:8px}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>NKN Viewer</h1>
+    <span class="chip" id="addrChip">addr: —</span>
+    <span class="chip" id="topicChip">topic: —</span>
+    <span class="chip" id="serverChip">server: —</span>
+    <div class="bar">
+      <button class="btn" id="openSettings">Settings</button>
+      <button class="btn" id="restartBtn">Restart</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="view" id="colorView">
+      <div class="overlay"><span class="tag">COLOR</span><span class="muted" id="colorMeta"></span></div>
+      <canvas id="colorCanvas"></canvas>
+    </section>
+    <section class="view" id="depthView" style="display:none">
+      <div class="overlay"><span class="tag">DEPTH</span><span class="muted" id="depthMeta"></span></div>
+      <canvas id="depthCanvas"></canvas>
+    </section>
+    <section class="view" id="chatView">
+      <div class="overlay"><span class="tag">CHAT</span><span class="muted" id="chatMeta"></span></div>
+      <div class="chatwrap">
+        <div id="chatLog"></div>
+        <div class="chatInput">
+          <input id="chatText" type="text" placeholder="Type message… (Enter to send)" />
+          <select id="chatTarget">
+            <option value="viewers">Viewers (broadcast)</option>
+            <option value="agent">Agent (control)</option>
+          </select>
+          <button class="btn" id="sendBtn">Send</button>
+        </div>
+      </div>
+    </section>
+  </main>
+  <div class="statusline" id="status">idle</div>
+
+  <!-- Modal -->
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <header><h2 id="modalTitle">Viewer Settings</h2></header>
+      <div class="content">
+        <form id="cfgForm" class="form">
+          <div class="row" style="grid-column:1 / span 2">
+            <label>Signaling Server (hex or full NKN addr)</label>
+            <input id="serverHexOrAddr" type="text" placeholder="e.g. d0c0... (64 hex) or sig.d0c0... (full)" />
+            <span class="help">Paste the server’s 64-hex and we’ll use <b>sig.&lt;hex&gt;</b>; full addrs also ok.</span>
+          </div>
+          <div class="row"><label>Topic Prefix</label><input id="topicPrefix" type="text" placeholder="roko-signaling" /></div>
+          <div class="row"><label>Agent UUID</label><input id="viewUuid" type="text" placeholder="agent-uuid" /></div>
+          <div class="row"><label>Show Depth</label><div><input id="showDepth" type="checkbox" /></div></div>
+          <div class="row"><label>FPS Cap</label><input id="fpsCap" type="number" min="1" max="120" step="1" placeholder="30" /></div>
+          <div class="row" style="grid-column:1 / span 2">
+            <label>Client Seed (hex, 64) — optional</label>
+            <input id="clientSeed" type="text" placeholder="auto-generated & stored if empty" />
+          </div>
+          <div class="row" style="grid-column:1 / span 2"><div class="err" id="formErr"></div></div>
+        </form>
+      </div>
+      <footer>
+        <button class="btn" id="cancelBtn">Cancel</button>
+        <button class="btn" id="saveBtn">Save & Start</button>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+  ;(() => {
+    const $ = sel => document.querySelector(sel);
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const toHex = (buf) => Array.from(buf).map(b => b.toString(16).padStart(2,'0')).join('');
+    const fromB64 = (b64) => Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const looksLikeNknAddr = s => /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/.test((s||'').trim());
+    const now = () => performance.now() / 1000;
+
+    const LS = {
+      read(){ try { return JSON.parse(localStorage.getItem('nkn_viewer_cfg')||'{}'); } catch { return {}; } },
+      write(cfg){ localStorage.setItem('nkn_viewer_cfg', JSON.stringify(cfg)); }
+    };
+
+    function normalizeServerAddress(input){
+      let s=(input||'').trim().replace(/^0x/,'').toLowerCase();
+      if(!s) return '';
+      if(/^[0-9a-f]{64}$/.test(s)) return `sig.${s}`;
+      if(looksLikeNknAddr(s)) return s;
+      return '';
+    }
+
+    const state = {
+      serverSig:null, topicPrefix:'roko-signaling', clientAddr:null, client:null,
+      stats:{frames:0,bytes:0,t0:now(),fps:0,bps:0},
+      fpsCap:30, uuid:'', showDepth:false, running:false,
+      nick:null
+    };
+
+    const ui = {
+      colorCanvas: $('#colorCanvas'), depthCanvas: $('#depthCanvas'),
+      colorMeta: $('#colorMeta'), depthMeta: $('#depthMeta'),
+      addrChip: $('#addrChip'), topicChip: $('#topicChip'), serverChip: $('#serverChip'),
+      status: $('#status'), depthView: $('#depthView'),
+      chatLog: $('#chatLog'), chatText: $('#chatText'), chatTarget: $('#chatTarget'),
+      sendBtn: $('#sendBtn'), chatMeta: $('#chatMeta')
+    };
+    const ctxColor = ui.colorCanvas.getContext('2d');
+    const ctxDepth = ui.depthCanvas.getContext('2d');
+
+    // Modal
+    const modal = {
+      backdrop: $('#modalBackdrop'),
+      open(){ this.backdrop.style.display='flex'; },
+      close(){ this.backdrop.style.display='none'; },
+      fillFromLS(){
+        const cfg = LS.read();
+        $('#serverHexOrAddr').value = cfg.serverHexOrAddr || '';
+        $('#topicPrefix').value     = cfg.topicPrefix     || 'roko-signaling';
+        $('#viewUuid').value        = cfg.viewUuid        || '';
+        $('#showDepth').checked     = !!cfg.showDepth;
+        $('#fpsCap').value          = cfg.fpsCap || 30;
+        $('#clientSeed').value      = cfg.clientSeed || '';
+      },
+      grab(){
+        const serverHexOrAddr = $('#serverHexOrAddr').value.trim();
+        const topicPrefix     = ($('#topicPrefix').value || 'roko-signaling').trim();
+        const viewUuid        = $('#viewUuid').value.trim();
+        const showDepth       = $('#showDepth').checked;
+        const fpsCap          = Math.max(1, Math.min(120, parseInt($('#fpsCap').value,10)||30));
+        let clientSeed        = ($('#clientSeed').value||'').trim().toLowerCase().replace(/^0x/,'');
+        if(clientSeed && !/^[0-9a-f]{64}$/.test(clientSeed)) throw new Error('Client seed must be 64 hex chars.');
+        const serverSig = normalizeServerAddress(serverHexOrAddr);
+        if(!serverSig) throw new Error('Enter a valid server hex (64) or full NKN address.');
+        if(!viewUuid) throw new Error('Agent UUID is required.');
+        return { serverHexOrAddr, serverSig, topicPrefix, viewUuid, showDepth, fpsCap, clientSeed };
+      },
+      save(cfg){
+        LS.write({
+          serverHexOrAddr: cfg.serverHexOrAddr, topicPrefix: cfg.topicPrefix,
+          viewUuid: cfg.viewUuid, showDepth: cfg.showDepth, fpsCap: cfg.fpsCap,
+          clientSeed: cfg.clientSeed
+        });
+      }
+    };
+
+    $('#openSettings').addEventListener('click', ()=>{ modal.fillFromLS(); modal.open(); });
+    $('#cancelBtn').addEventListener('click', ()=> modal.close());
+    $('#saveBtn').addEventListener('click', async ()=>{
+      const err = $('#formErr'); err.textContent = '';
+      try { const cfg = modal.grab(); modal.save(cfg); modal.close(); await restart(); }
+      catch(e){ err.textContent = e.message || String(e); }
+    });
+    $('#restartBtn').addEventListener('click', ()=> restart());
+
+    // Chat helpers
+    function shortAddr(addr){ if(!addr) return 'unknown'; const s=String(addr); return s.slice(0,7)+'…'+s.slice(-6); }
+    function appendMsg({who, from, text, mine=false}){
+      const el = document.createElement('div');
+      el.className = 'msg'+(mine?' me':'');
+      el.innerHTML = `<div class="who">${who}${from?` • ${shortAddr(from)}`:''}</div><div class="bubble"></div>`;
+      el.querySelector('.bubble').textContent = text;
+      ui.chatLog.appendChild(el);
+      ui.chatLog.scrollTop = ui.chatLog.scrollHeight;
+    }
+
+    // NKN Client
+    function getOrCreateSeedHex(userSeed){
+      if(userSeed) return userSeed;
+      let hex = localStorage.getItem('CLIENT_NKN_SEED_HEX');
+      if(/^[0-9a-f]{64}$/.test(hex||'')) return hex;
+      const arr = new Uint8Array(32);
+      (crypto||window.msCrypto).getRandomValues(arr);
+      hex = toHex(arr);
+      localStorage.setItem('CLIENT_NKN_SEED_HEX', hex);
+      return hex;
+    }
+
+    function normalizeInbound(a,b){
+      if(a && typeof a==='object' && (a.payload!==undefined || a.data!==undefined || a.src!==undefined || a.from!==undefined)){
+        const src = a.src || a.from || a.addr || '';
+        const payload = (a.payload!==undefined)?a.payload:a.data;
+        return { src, payload };
+      }
+      return { src:a, payload:b };
+    }
+
+    function payloadToString(payload){
+      if(payload==null) return '';
+      try{
+        if(payload instanceof Uint8Array) return new TextDecoder().decode(payload);
+        if(typeof payload==='string') return payload;
+        if(typeof payload==='object') return JSON.stringify(payload);
+        return String(payload);
+      }catch{ return ''; }
+    }
+
+    async function startClient({ seedHex, identifier='viewer' }){
+      const client = new nkn.MultiClient({ seed: seedHex, identifier });
+      ui.status.textContent = 'connecting to NKN …';
+      client.onConnect(()=>{
+        ui.status.textContent = 'NKN ready';
+        state.clientAddr = client.addr;
+        ui.addrChip.textContent = `addr: ${client.addr}`;
+        if(looksLikeNknAddr(state.serverSig)){
+          client.send(state.serverSig, JSON.stringify({ event:'viewer-hello', uuid: state.uuid }));
+        }
+      });
+      client.on('message',(a,b)=>{
+        try{
+          const {src,payload} = normalizeInbound(a,b);
+          const txt = payloadToString(payload);
+          let body = {};
+          try{ body = JSON.parse(txt); } catch { body = { raw: txt }; }
+          handleInbound(src, body);
+        }catch(e){ console.warn('bad inbound', e); }
+      });
+      window.addEventListener('beforeunload', ()=>{
+        try{ client.send(state.serverSig, JSON.stringify({ event:'viewer-bye', uuid: state.uuid })); }catch{}
+      });
+      return client;
+    }
+
+    function updateStats(nbytes){
+      const t = now();
+      state.stats.frames += 1;
+      state.stats.bytes  += nbytes;
+      const dt = t - state.stats.t0;
+      if(dt >= 1.0){
+        state.stats.fps = state.stats.frames / dt;
+        state.stats.bps = state.stats.bytes / dt;
+        state.stats.frames = 0; state.stats.bytes = 0; state.stats.t0 = t;
+      }
+      ui.chatMeta.textContent = `uuid=${state.uuid} • viewers chat via server`;
+    }
+
+    const latest = {
+      color:{ img:null, ts:0, bytes:0 },
+      depth:{ data:null, ts:0, bytes:0, isImage:true }
+    };
+
+    function handleInbound(src, body){
+      const ev = body && body.event; if(!ev) return;
+
+      if(ev==='viewer-ack'){
+        ui.status.textContent = `viewer-ack from server (uuid=${state.uuid})`;
+        appendMsg({ who:'system', from:src, text:`Joined viewer set for uuid=${state.uuid}` });
+        return;
+      }
+
+      if(ev==='frame-color' && body.uuid===state.uuid && typeof body.data==='string'){
+        const b64 = body.data;
+        latest.color.img = b64;
+        latest.color.ts  = performance.now();
+        latest.color.bytes = Math.floor(b64.length * 3 / 4);
+        updateStats(latest.color.bytes);
+        return;
+      }
+
+      if(ev==='frame-depth' && state.showDepth && body.uuid===state.uuid && typeof body.data==='string'){
+        const b64 = body.data;
+        latest.depth.data  = b64;
+        latest.depth.ts    = performance.now();
+        latest.depth.bytes = Math.floor(b64.length * 3 / 4);
+        latest.depth.isImage = true;
+        updateStats(latest.depth.bytes);
+        return;
+      }
+
+      // NEW: incoming viewer chat
+      if(ev==='viewer-say' && body.uuid===state.uuid && typeof body.text==='string'){
+        const mine = src===state.clientAddr; // server echoes to everyone (incl. sender)
+        const who = mine ? 'me' : 'peer';
+        appendMsg({ who, from: body.from || src, text: body.text, mine });
+        return;
+      }
+
+      // Optional: ack from control
+      if(ev==='control-ack' && body.uuid===state.uuid){
+        appendMsg({ who:'system', from: src, text:'control-ack sent to agent' });
+        return;
+      }
+    }
+
+    async function drawLoop(){
+      const frameInterval = Math.max(1.0/state.fpsCap, 1.0/60.0);
+      let last = 0;
+      const draw = async (tMs)=>{
+        const t = tMs / 1000;
+        if(!state.running) return;
+        if(t - last >= frameInterval){
+          last = t;
+          if(latest.color.img){ await drawImageB64ToCanvas(latest.color.img, ui.colorCanvas, ctxColor); }
+          if(state.showDepth && latest.depth.data){
+            if(latest.depth.isImage){ await drawImageB64ToCanvas(latest.depth.data, ui.depthCanvas, ctxDepth); }
+          }
+          ui.colorMeta.textContent = metaLine();
+          if(state.showDepth) ui.depthMeta.textContent = metaLine();
+        }
+        requestAnimationFrame(draw);
+      };
+      requestAnimationFrame(draw);
+    }
+
+    function metaLine(){
+      const Mbps = (state.stats.bps * 8 / 1e6).toFixed(2);
+      return `uuid=${state.uuid} • fps=${state.stats.fps.toFixed(1)} • rate=${Mbps} Mbps`;
+    }
+
+    async function drawImageB64ToCanvas(b64, canvas, ctx){
+      const blob = new Blob([fromB64(b64)], { type:'image/*' });
+      const bmp = await createImageBitmap(blob);
+      if(canvas.width!==bmp.width || canvas.height!==bmp.height){ canvas.width=bmp.width; canvas.height=bmp.height; }
+      ctx.drawImage(bmp,0,0,canvas.width,canvas.height);
+      ctx.save(); ctx.globalAlpha=0.4; ctx.fillStyle='#000'; ctx.fillRect(0,0,canvas.width,42); ctx.restore();
+      ctx.font='16px system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial'; ctx.fillStyle='#fff';
+      ctx.fillText(metaLine(),12,26);
+    }
+
+    // Send chat
+    function sendChat(){
+      const txt = ui.chatText.value.trim(); if(!txt) return;
+      if(!state.client) return;
+      const target = ui.chatTarget.value;
+      if(target==='viewers'){
+        // relay through server to all viewers of this uuid
+        state.client.send(state.serverSig, JSON.stringify({ event:'viewer-say', uuid: state.uuid, text: txt }));
+        // optimistic local echo (server will echo too; we mark as mine when it arrives)
+        appendMsg({ who:'me', from: state.clientAddr, text: txt, mine:true });
+      } else if(target==='agent'){
+        // use existing control relay to agent
+        state.client.send(state.serverSig, JSON.stringify({ event:'control', uuid: state.uuid, command: txt }));
+        appendMsg({ who:'to agent', from: state.clientAddr, text: txt, mine:true });
+      }
+      ui.chatText.value = '';
+    }
+    ui.sendBtn.addEventListener('click', sendChat);
+    ui.chatText.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); sendChat(); } });
+
+    async function restart(){
+      const cfg = LS.read();
+      const serverSig  = normalizeServerAddress(cfg.serverHexOrAddr || '');
+      const topicPrefix= (cfg.topicPrefix || 'roko-signaling').trim();
+      const uuid       = (cfg.viewUuid || '').trim();
+      const fpsCap     = cfg.fpsCap || 30;
+      const clientSeed = (cfg.clientSeed || '').trim().toLowerCase();
+
+      if(!serverSig || !uuid){ modal.fillFromLS(); modal.open(); return; }
+
+      state.uuid = uuid; state.showDepth = !!cfg.showDepth; state.fpsCap = fpsCap;
+      state.topicPrefix = topicPrefix; state.serverSig = serverSig;
+
+      ui.depthView.style.display = state.showDepth ? '' : 'none';
+      ui.topicChip.textContent = `topic: ${state.topicPrefix}`;
+      ui.serverChip.textContent = `server: ${state.serverSig}`;
+      ui.chatMeta.textContent = `uuid=${state.uuid} • viewers chat via server`;
+
+      const seedHex = getOrCreateSeedHex(clientSeed);
+      if(clientSeed && clientSeed!==seedHex){ localStorage.setItem('CLIENT_NKN_SEED_HEX', clientSeed); }
+
+      if(state.client && state.client.close){ try{ state.client.close(); }catch{} }
+
+      state.clientAddr=null;
+      state.client = await startClient({ seedHex });
+      state.running = true;
+
+      for(let i=0;i<400;i++){ if(state.clientAddr) break; await sleep(25); }
+      if(!state.clientAddr){ ui.status.textContent='NKN client did not become ready.'; state.running=false; return; }
+
+      ui.status.textContent = 'Viewer running. Press Settings to change params.';
+      drawLoop();
+    }
+
+    (function init(){
+      const cfg = LS.read();
+      if(!cfg.serverHexOrAddr || !cfg.viewUuid){ modal.fillFromLS(); modal.open(); }
+      else { restart(); }
+    })();
+  })();
+  </script>
+</body>
+</html>
