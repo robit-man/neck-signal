@@ -17,29 +17,18 @@
     *{box-sizing:border-box; -webkit-tap-highlight-color: transparent;}
     html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;}
     a{color:inherit}
-  .qrwrap canvas, .qrwrap img {
-    image-rendering: pixelated;
-    width: auto !important;
-    height: auto !important;
-    max-width: 100%;
-    display: block;
-  }
+    .qrwrap canvas, .qrwrap img { image-rendering: pixelated; width:auto!important; height:auto!important; max-width:100%; display:block; }
 
-  /* Header chips scroll horizontally on overflow (mobile) */
-  header.app .chiprow{
-    display:flex; gap:8px; flex:1 1 auto; min-width:0;
-    overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap; padding:0 4px;
-  }
+    header.app .chiprow{
+      display:flex; gap:8px; flex:1 1 auto; min-width:0;
+      overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap; padding:0 4px;
+    }
     header.app{
       position:sticky; top:0; z-index:2;
       padding:12px max(12px, env(safe-area-inset-left)) 12px max(12px, env(safe-area-inset-right));
       background:var(--panel); border-bottom:1px solid #0e141c; display:flex; gap:8px; align-items:center;
     }
     header.app h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.3px;flex:0 0 auto}
-    .chiprow{
-      display:flex; gap:8px; flex:1 1 auto; min-width:0;
-      overflow-x:auto; -webkit-overflow-scrolling: touch; scrollbar-width: thin; white-space:nowrap; padding:0 4px;
-    }
     .chip{padding:6px 10px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:12px;white-space:nowrap;flex:0 0 auto}
     .actions{flex:0 0 auto; display:flex; gap:8px}
     .btn{appearance:none;border:1px solid #1f2a3a;background:var(--panel2);color:var(--fg);padding:10px 14px;border-radius:10px;font-weight:600}
@@ -117,13 +106,26 @@
       <div class="content">
         <div class="live-wrap">
           <div class="live-panel" style="flex:1 1 360px; min-width:280px;">
-            <div class="canvasbox"><canvas id="liveCanvas" width="640" height="360" aria-label="Live frame"></canvas></div>
-            <div class="small">fps: <span id="liveFps">0.0</span> • last: <span id="liveMeta">—</span></div>
+            <!-- Color -->
+            <div class="canvasbox"><canvas id="liveCanvas" width="640" height="360" aria-label="Color frame"></canvas></div>
+            <div class="small">color fps: <span id="liveFps">0.0</span> • last: <span id="liveMeta">—</span></div>
+            <!-- Depth -->
+            <div class="canvasbox" style="margin-top:8px;"><canvas id="depthCanvas" width="640" height="360" aria-label="Depth frame"></canvas></div>
+            <div class="small">depth: <span id="depthMeta">—</span></div>
+
+            <!-- Three.js pose viewer -->
+            <div class="canvasbox" style="margin-top:8px;"><canvas id="poseCanvas" width="640" height="360" aria-label="Phone pose"></canvas></div>
+            <div class="row">
+              <button class="btn" id="btnSensors" title="Request motion/orientation permission (iOS)">Sensors</button>
+              <button class="btn" id="btnCenter"  title="Center orientation baseline">Center</button>
+              <button class="btn" id="btnOrient"  title="Toggle orientation streaming">Orientation: Off</button>
+            </div>
+            <div class="small mono" id="yprLabel">Yaw 0° • Pitch 0° • Roll 0°</div>
           </div>
 
           <div class="live-panel" style="min-width:260px; flex:1 1 300px;">
-            <div><b>Resolution</b> (<span id="resVal">60</span>%)</div>
-            <input id="resSlider" type="range" min="20" max="100" step="5" value="60" />
+            <div><b>Resolution</b> (<span id="resVal">20</span>%)</div>
+            <input id="resSlider" type="range" min="10" max="100" step="5" value="20" />
             <div class="small">Sends <code>/res N%</code> to the selected device.</div>
 
             <div class="row" style="margin-top:10px;">
@@ -160,7 +162,7 @@
       <div class="content">
         <div class="row"><label style="min-width:110px">Label</label><input id="inpLabel" type="text" placeholder="My Phone" /></div>
         <div class="row"><label style="min-width:110px">Seed (64-hex)</label><input id="inpSeed" type="text" placeholder="Auto if empty" /></div>
-        <div class="row"><label style="min-width:110px">Scopes (CSV)</label><input id="inpScopes" type="text" value="video:rgb" /></div>
+        <div class="row"><label style="min-width:110px">Scopes (CSV)</label><input id="inpScopes" type="text" value="video:rgb,video:depth" /></div>
         <div class="row"><label style="min-width:110px">Expiry (minutes)</label><input id="inpExpMin" type="number" value="60" /></div>
         <div class="small">Seed is stored locally; keys are Ed25519 (same for NKN & invite signing).</div>
         <div class="row" style="margin-top:16px;"><button class="btn wide" id="btnRestart">Restart NKN Client</button></div>
@@ -181,11 +183,11 @@
 
   <div id="toast" class="toast"></div>
 
+  <!-- Core NKN client + UI logic -->
   <script>
   window.addEventListener('DOMContentLoaded', () => {
     const $ = s => document.querySelector(s);
     const enc = new TextEncoder(), dec = new TextDecoder();
-    const now = () => Date.now()/1000;
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const b64u = {
       enc: (u8) => btoa(String.fromCharCode(...u8)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),
@@ -262,44 +264,140 @@
         }
         return false;
       };
+
+      // Expose a tiny hook for the Three.js module
+      window.NKN = {
+        hasTarget: ()=> !!state.targetDevice,
+        sendCmd: (cmd)=> state.targetDevice ? state.dm(state.targetDevice, {event:'cmd', cmd:String(cmd)}) : Promise.resolve(false),
+        sendRaw: (obj)=> state.targetDevice ? state.dm(state.targetDevice, obj) : Promise.resolve(false),
+        toast
+      };
     }
 
-    // Inbound: grant → address book; frames → live canvas; ack/stats → status line
+    // ----- Canvas + drawing (keep last frame) -----
     const canvas = $('#liveCanvas');
     const ctx = canvas.getContext('2d');
-    let lastDraw = performance.now(), drawCount = 0, fps = 0.0;
+    const dCanvas = $('#depthCanvas');
+    const dCtx = dCanvas.getContext('2d');
 
-    function drawFrameFromBase64(b64){
+    const cache = { colorImg: null, depthImg: null }; // last images
+
+    function fitCanvasToBox(c){
+      const w = c.parentElement.clientWidth || 640;
+      const h = Math.round(w * (9/16));
+      c.width = w; c.height = h;
+    }
+
+    function drawContained(img, c, x){
+      if (!img) return;
+      x.save();
+      x.clearRect(0,0,c.width,c.height);
+      const scale = Math.min(c.width / img.width, c.height / img.height);
+      const dw = Math.round(img.width * scale);
+      const dh = Math.round(img.height * scale);
+      const dx = Math.floor((c.width - dw)/2);
+      const dy = Math.floor((c.height - dh)/2);
+      x.imageSmoothingEnabled = true;
+      x.imageSmoothingQuality = 'high';
+      x.drawImage(img, dx, dy, dw, dh);
+      x.restore();
+    }
+
+    // UI state for stable “depth: from • fps”
+    const depthUI = { from: '—', fps: '0.0', inflight: false, lastTS: performance.now(), count: 0 };
+    function renderDepthMeta(){ $('#depthMeta').textContent = `from ${depthUI.from} • fps ${depthUI.fps}`; }
+
+    // Color FPS helper
+    const colorUI = { inflight:false, lastTS: performance.now(), count:0, fps:'0.0' };
+    function renderColorFPS(){ $('#liveFps').textContent = colorUI.fps; }
+
+    // Color decode (guarded)
+    function drawColorFromBase64(b64){
+      if (colorUI.inflight) return;
+      colorUI.inflight = true;
       const img = new Image();
       img.onload = () => {
-        // Fit to container width
-        const cssW = canvas.parentElement.clientWidth || 640;
-        const scale = Math.min(1, cssW / img.width);
-        const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
-        canvas.width = w; canvas.height = h;
-        ctx.drawImage(img, 0, 0, w, h);
-        drawCount++; const nowp=performance.now();
-        if (nowp - lastDraw >= 1000){ fps = drawCount * 1000 / (nowp - lastDraw); drawCount=0; lastDraw=nowp; $('#liveFps').textContent = fps.toFixed(1); }
+        colorUI.inflight = false;
+        cache.colorImg = img;
+        drawContained(img, canvas, ctx);
+        const now = performance.now();
+        colorUI.count++;
+        if (now - colorUI.lastTS >= 1000){
+          const cfps = colorUI.count * 1000 / (now - colorUI.lastTS);
+          colorUI.fps = cfps.toFixed(1);
+          colorUI.count = 0; colorUI.lastTS = now;
+          renderColorFPS();
+        }
       };
+      img.onerror = () => { colorUI.inflight = false; };
       img.src = 'data:image/jpeg;base64,' + b64;
     }
 
+    // Depth decode (guarded)
+    function drawDepthFromBase64(b64){
+      if (depthUI.inflight) return;        // drop if a decode is already in-flight
+      depthUI.inflight = true;
+      const img = new Image();
+      img.onload = () => {
+        depthUI.inflight = false;
+        cache.depthImg = img;
+        drawContained(img, dCanvas, dCtx);
+
+        const now = performance.now();
+        depthUI.count++;
+        if (now - depthUI.lastTS >= 1000){
+          const dfps = depthUI.count * 1000 / (now - depthUI.lastTS);
+          depthUI.fps = dfps.toFixed(1);
+          depthUI.count = 0; depthUI.lastTS = now;
+          renderDepthMeta();
+        }
+      };
+      img.onerror = () => { depthUI.inflight = false; };
+      img.src = 'data:image/png;base64,' + b64;
+    }
+
+    function redrawFromCache(){
+      drawContained(cache.colorImg, canvas, ctx);
+      drawContained(cache.depthImg, dCanvas, dCtx);
+    }
+
+    // Inbound: grant → address book; frames → canvases; ack/stats → status line
+    const streamsByDevice = {};
     function handleInbound(src, body){
       if (!body || typeof body!=='object') return;
+
       if (body.type==='grant' && body.grant && body.grant.token){
         const g = body.grant;
         BOOK.add({ device: g.device || 'device', token: g.token, scopes: g.scopes || [], exp: g.exp || 0, receivedAt: Math.floor(Date.now()/1000), from: src });
         toast('Grant received');
+
       } else if (body.event === 'frame-color' && body.data){
         $('#liveMeta').textContent = `from ${src}`;
-        drawFrameFromBase64(body.data);
+        drawColorFromBase64(body.data);
+
+      } else if (body.event === 'frame-depth' && body.data){
+        depthUI.from = src;        // record who sent it
+        renderDepthMeta();         // show from immediately
+        drawDepthFromBase64(body.data);
+
+      } else if (body.event === 'streams'){
+        streamsByDevice[src] = body;
+        const bits = [];
+        if (body?.color?.topic) bits.push(`colorTopic:${body.color.topic}`);
+        if (body?.depth?.topic) bits.push(`depthTopic:${body.depth.topic}`);
+        if (bits.length) $('#kvReady').textContent = 'ready • ' + bits.join(' • ');
+
       } else if (body.event === 'ack' || body.event === 'cmd-ack'){
         const ok = body.ok ? '✓' : '✗';
         const msg = body.note || body.msg || '';
         $('#cmdAck').textContent = `${ok} ${msg}`;
+
       } else if (body.event === 'stats'){
         const s = body;
         $('#cmdAck').textContent = `fps_out=${s.fps_out} size=${s.jpeg_bytes} w=${s.w} h=${s.h}`;
+
+      } else if (body.event === 'hello'){
+        window.NKN?.sendRaw({event:'hello-ack'});
       }
     }
 
@@ -308,7 +406,7 @@
       const cfg = LS.read();
       $('#inpLabel').value  = cfg.label || 'My Client';
       $('#inpSeed').value   = cfg.seedHex || '';
-      $('#inpScopes').value = cfg.scopes || 'video:rgb';
+      $('#inpScopes').value = cfg.scopes || 'video:rgb,video:depth';
       $('#inpExpMin').value = cfg.expMin || 60;
       const { seedHex, pubHex } = seedHexToKeyPair(cfg.seedHex||'');
       $('#kvLabel').textContent = cfg.label || 'My Client';
@@ -321,7 +419,7 @@
       const s   = ($('#inpSeed').value||'').trim().toLowerCase().replace(/^0x/,'');
       if (s && !looksHex64(s)){ alert('Seed must be 64 hex'); return; }
       cfg.seedHex = s || cfg.seedHex || '';
-      cfg.scopes  = ($('#inpScopes').value || 'video:rgb').trim();
+      cfg.scopes  = ($('#inpScopes').value || 'video:rgb,video:depth').trim();
       cfg.expMin  = Math.max(1, parseInt($('#inpExpMin').value||'60',10));
       LS.write(cfg);
       loadSettingsIntoUI();
@@ -371,7 +469,7 @@
       const cfg = LS.read();
       const { kp } = seedHexToKeyPair(cfg.seedHex||'');
       const clientPubB64u = b64u.enc(kp.publicKey);
-      const scopesShort = 'r'; // "video:rgb"
+      const scopesShort = 'rd'; // rgb + depth
       const expSec = Math.floor(Date.now()/1000) + (Math.max(1, cfg.expMin||60)*60);
       const exp36 = expSec.toString(36);
       const nonce = crypto.getRandomValues(new Uint8Array(12));
@@ -417,7 +515,16 @@
     $('#btnStatsOnce').onclick = ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {event:'cmd', cmd:'/stats once'}); };
     $('#btnStatsToggle').onclick= ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {event:'cmd', cmd:'/stats'}); };
 
-    // Events
+    // Layout / resize — keep size stable and redraw last good frames
+    function onResize(){
+      fitCanvasToBox(canvas);
+      fitCanvasToBox(dCanvas);
+      redrawFromCache();
+    }
+    window.addEventListener('resize', onResize, {passive:true});
+    onResize(); // initial size
+
+    // Settings & boot
     $('#btnSettings').onclick = () => document.querySelector('#secSettings').scrollIntoView({behavior:'smooth'});
     $('#btnSave').onclick = saveSettingsFromUI;
     $('#btnRestart').onclick = startOrRestart;
@@ -425,20 +532,172 @@
     $('#btnCloseQR').onclick = () => { $('#qrModal').style.display='none'; };
     $('#btnClearBook').onclick = () => { if (confirm('Clear all grants?')) { BOOK.clear(); renderDeviceSelect(); } };
 
-    // Boot
-    function onResize(){ // keep canvas fitting container on rotate
-      const w = canvas.parentElement.clientWidth || 640;
-      const h = Math.round(w * (9/16));
-      canvas.width = w; canvas.height = h;
-    }
-    window.addEventListener('resize', onResize, {passive:true});
-    onResize();
-
     loadSettingsIntoUI();
     renderBook();
     renderDeviceSelect();
     startOrRestart();
   });
+  </script>
+
+  <!-- three.js importmap + module for pose + orientation → command -->
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.175.0/build/three.module.js" } }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+
+    const poseCanvas = document.getElementById('poseCanvas');
+    const btnSensors = document.getElementById('btnSensors');
+    const btnCenter  = document.getElementById('btnCenter');
+    const btnOrient  = document.getElementById('btnOrient');
+    const yprLabel   = document.getElementById('yprLabel');
+
+    // Renderer / Scene
+    const renderer = new THREE.WebGLRenderer({ canvas: poseCanvas, antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a0a);
+    const cam = new THREE.PerspectiveCamera(55, 16/9, 0.1, 50);
+    cam.position.set(0, 0, 4);
+    scene.add(cam);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x222222, 1.0));
+    const dl = new THREE.DirectionalLight(0xffffff, 0.35); dl.position.set(1,1,1); scene.add(dl);
+
+    // Phone slab
+    const phone = new THREE.Mesh(
+      new THREE.BoxGeometry(0.7, 1.4, 0.05),
+      new THREE.MeshBasicMaterial({ color: 0x1976d2, wireframe: true, transparent: true, opacity: 0.25 })
+    );
+    scene.add(phone);
+
+    // Grid plane
+    const grid = new THREE.GridHelper(10, 10, 0x333333, 0x222222);
+    grid.position.y = -1; scene.add(grid);
+
+    function resizePose() {
+      const rect = poseCanvas.parentElement.getBoundingClientRect();
+      const w = Math.max(280, rect.width);
+      const h = Math.round(w * (9/16));
+      renderer.setSize(w, h, false);
+      cam.aspect = w / h; cam.updateProjectionMatrix();
+    }
+    window.addEventListener('resize', resizePose, {passive:true});
+    resizePose();
+
+    // Orientation math
+    const rad = THREE.MathUtils.degToRad;
+    const deg = THREE.MathUtils.radToDeg;
+    const corrQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2);
+
+    let curQuat  = new THREE.Quaternion();
+    let baseQuat = null;
+
+    let yaw=0, pitch=0, roll=0;
+    let accel = {x:0,y:0,z:0};
+    let trans = {Y:0,Z:0,H:0};
+
+    const GAIN_YAW=8, GAIN_PITCH=8, GAIN_ROLL=8;
+    const DECAY = 0.90;
+
+    function deviceToQuat(alpha, beta, gamma) {
+      const e = new THREE.Euler(rad(beta), rad(alpha), -rad(gamma), 'YXZ');
+      const q = new THREE.Quaternion().setFromEuler(e);
+      q.multiply(corrQuat);
+      return q;
+    }
+
+    function getRelativeYPRDeg() {
+      if (!baseQuat) return {yaw:0,pitch:0,roll:0};
+      const invBase = baseQuat.clone().invert();
+      const rel = invBase.multiply(curQuat);
+      const e = new THREE.Euler().setFromQuaternion(rel, 'YXZ');
+      return { yaw: deg(e.y), pitch: deg(e.x), roll: deg(e.z) };
+    }
+
+    // Render loop
+    function loop(){ renderer.render(scene, cam); requestAnimationFrame(loop); }
+    loop();
+
+    // Sensors
+    async function requestSensorPermissions() {
+      try {
+        let p1 = (window.DeviceMotionEvent && typeof DeviceMotionEvent.requestPermission === 'function')
+          ? await DeviceMotionEvent.requestPermission() : 'granted';
+        let p2 = (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function')
+          ? await DeviceOrientationEvent.requestPermission() : 'granted';
+        if (p1 !== 'granted' || p2 !== 'granted') {
+          window.NKN?.toast?.('Enable motion/orientation in browser settings');
+          return false;
+        }
+        return true;
+      } catch { return true; }
+    }
+
+    btnSensors.addEventListener('click', async () => {
+      if (await requestSensorPermissions()) btnSensors.disabled = true;
+    });
+    if (!/iphone|ipad|ipod/i.test(navigator.userAgent)) btnSensors.disabled = true;
+
+    window.addEventListener('deviceorientation', e => {
+      if (e.alpha == null) return;
+      yaw = e.alpha; pitch = e.beta; roll = e.gamma;
+      curQuat.copy(deviceToQuat(yaw, pitch, roll));
+      phone.setRotationFromQuaternion(curQuat);
+      yprLabel.textContent = `Yaw ${yaw.toFixed(0)}° • Pitch ${pitch.toFixed(0)}° • Roll ${roll.toFixed(0)}°`;
+    }, true);
+
+    window.addEventListener('devicemotion', e => {
+      let a = e.acceleration && (e.acceleration.x!=null) ? e.acceleration : e.accelerationIncludingGravity;
+      if (a) accel = { x: a.x || 0, y: a.y || 0, z: a.z || 0 };
+    }, true);
+
+    btnCenter.addEventListener('click', () => {
+      baseQuat = curQuat.clone();
+      window.NKN?.toast?.('Centered');
+    });
+
+    // Orientation streaming toggle
+    let orientOn = false;
+    let tickTimer = null;
+    const TICK_MS = 60; // ~16 Hz
+
+    const clamp = (v,min,max)=>Math.min(max,Math.max(min,v));
+    const decay = v => (Math.abs(v) < 1 ? 0 : v*DECAY);
+
+    function makeCommand(){
+      // transient translations from accel
+      trans.Z = clamp(decay(trans.Z + (-accel.y*10)), -400, 400);  // forward/back
+      trans.H = clamp(decay(trans.H + ( accel.z* 2)),   20,  50);  // up/down (0..50 clamp later)
+      trans.Y = clamp(decay(trans.Y + ( accel.x*10)), -400, 400);  // left/right
+
+      const { yaw:yDeg, pitch:pDeg, roll:rDeg } = getRelativeYPRDeg();
+      const X = clamp(-yDeg * GAIN_YAW,   -400, 400) * -1;
+      const P = clamp( pDeg * GAIN_PITCH, -400, 400);
+      const R = clamp( rDeg * GAIN_ROLL,  -400, 400);
+      const H = clamp(trans.H, 0, 50);
+
+      return `X${X.toFixed(0)},Y${trans.Y.toFixed(0)},Z${trans.Z.toFixed(0)},H${H.toFixed(0)},S1,A1,R${R.toFixed(0)},P${P.toFixed(0)}`;
+    }
+
+    function tick(){
+      if (!window.NKN?.hasTarget?.()) return;
+      const cmd = makeCommand();
+      window.NKN.sendCmd(cmd);
+      // surface briefly in UI without spamming
+      const ack = document.getElementById('cmdAck');
+      if (ack && Math.random() < 0.07) ack.textContent = `→ ${cmd}`;
+    }
+
+    function setOrient(on){
+      orientOn = !!on;
+      btnOrient.textContent = orientOn ? 'Orientation: On' : 'Orientation: Off';
+      if (tickTimer) { clearInterval(tickTimer); tickTimer=null; }
+      if (orientOn){
+        if (!baseQuat) baseQuat = curQuat.clone();
+        tickTimer = setInterval(tick, TICK_MS);
+      }
+    }
+    btnOrient.addEventListener('click', ()=> setOrient(!orientOn));
   </script>
 </body>
 </html>
