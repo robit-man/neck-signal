@@ -107,8 +107,12 @@
       <div class="content">
         <div class="live-wrap">
           <div class="live-panel" style="flex:1 1 360px; min-width:280px;">
-            <div class="canvasbox"><canvas id="liveCanvas" width="640" height="360" aria-label="Live frame"></canvas></div>
-            <div class="small">fps: <span id="liveFps">0.0</span> • last: <span id="liveMeta">—</span></div>
+            <!-- Color -->
+            <div class="canvasbox"><canvas id="liveCanvas" width="640" height="360" aria-label="Color frame"></canvas></div>
+            <div class="small">color fps: <span id="liveFps">0.0</span> • last: <span id="liveMeta">—</span></div>
+            <!-- Depth -->
+            <div class="canvasbox" style="margin-top:8px;"><canvas id="depthCanvas" width="640" height="360" aria-label="Depth frame"></canvas></div>
+            <div class="small">depth: <span id="depthMeta">—</span></div>
 
             <!-- Three.js pose viewer -->
             <div class="canvasbox" style="margin-top:8px;"><canvas id="poseCanvas" width="640" height="360" aria-label="Phone pose"></canvas></div>
@@ -185,7 +189,6 @@
   window.addEventListener('DOMContentLoaded', () => {
     const $ = s => document.querySelector(s);
     const enc = new TextEncoder(), dec = new TextDecoder();
-    const now = () => Date.now()/1000;
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const b64u = {
       enc: (u8) => btoa(String.fromCharCode(...u8)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),
@@ -272,24 +275,40 @@
       };
     }
 
-    // Inbound: grant → address book; frames → live canvas; ack/stats → status line
+    // Inbound: grant → address book; frames → canvases; ack/stats → status line
     const canvas = $('#liveCanvas');
     const ctx = canvas.getContext('2d');
+    const dCanvas = $('#depthCanvas');
+    const dCtx = dCanvas.getContext('2d');
     let lastDraw = performance.now(), drawCount = 0, fps = 0.0;
 
-    function drawFrameFromBase64(b64){
+    function drawToCanvasFromB64(b64, mime, outCanvas, outCtx){
       const img = new Image();
       img.onload = () => {
         // Fit to container width
-        const cssW = canvas.parentElement.clientWidth || 640;
+        const cssW = outCanvas.parentElement.clientWidth || 640;
         const scale = Math.min(1, cssW / img.width);
         const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
-        canvas.width = w; canvas.height = h;
-        ctx.drawImage(img, 0, 0, w, h);
-        drawCount++; const nowp=performance.now();
-        if (nowp - lastDraw >= 1000){ fps = drawCount * 1000 / (nowp - lastDraw); drawCount=0; lastDraw=nowp; $('#liveFps').textContent = fps.toFixed(1); }
+        outCanvas.width = w; outCanvas.height = h;
+        outCtx.clearRect(0,0,w,h);
+        outCtx.drawImage(img, 0, 0, w, h);
       };
-      img.src = 'data:image/jpeg;base64,' + b64;
+      img.src = `data:${mime};base64,` + b64;
+    }
+
+    function drawFrameFromBase64(b64){
+      drawToCanvasFromB64(b64, 'image/jpeg', canvas, ctx);
+      const nowp=performance.now();
+      drawCount++;
+      if (nowp - lastDraw >= 1000){
+        fps = drawCount * 1000 / (nowp - lastDraw);
+        drawCount=0; lastDraw=nowp; $('#liveFps').textContent = fps.toFixed(1);
+      }
+    }
+
+    function drawDepthFromBase64(b64){
+      // Expect PNG for depth; if you send JPEG depth, change MIME to image/jpeg
+      drawToCanvasFromB64(b64, 'image/png', dCanvas, dCtx);
     }
 
     function handleInbound(src, body){
@@ -301,6 +320,9 @@
       } else if (body.event === 'frame-color' && body.data){
         $('#liveMeta').textContent = `from ${src}`;
         drawFrameFromBase64(body.data);
+      } else if (body.event === 'frame-depth' && body.data){
+        $('#depthMeta').textContent = `from ${src}`;
+        drawDepthFromBase64(body.data);
       } else if (body.event === 'ack' || body.event === 'cmd-ack'){
         const ok = body.ok ? '✓' : '✗';
         const msg = body.note || body.msg || '';
@@ -437,10 +459,13 @@
     $('#btnClearBook').onclick = () => { if (confirm('Clear all grants?')) { BOOK.clear(); renderDeviceSelect(); } };
 
     // Boot
-    function onResize(){ // keep canvas fitting container on rotate
-      const w = canvas.parentElement.clientWidth || 640;
-      const h = Math.round(w * (9/16));
-      canvas.width = w; canvas.height = h;
+    function onResize(){ // keep canvases fitting container on rotate
+      const fit = (c)=>{
+        const w = c.parentElement.clientWidth || 640;
+        const h = Math.round(w * (9/16));
+        c.width = w; c.height = h;
+      };
+      fit(canvas); fit(dCanvas);
     }
     window.addEventListener('resize', onResize, {passive:true});
     onResize();
@@ -593,7 +618,7 @@
       if (!window.NKN?.hasTarget?.()) return;
       const cmd = makeCommand();
       window.NKN.sendCmd(cmd);
-      // (optional) surface what we’re sending in the ack area without spamming
+      // (optional) surface briefly in UI without spamming
       const ack = document.getElementById('cmdAck');
       if (ack && Math.random() < 0.07) ack.textContent = `→ ${cmd}`;
     }
