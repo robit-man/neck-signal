@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <title>NKN Client — QR Pair (Mobile First)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#0b0f14">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%230b0f14'/%3E%3Ctext x='32' y='40' font-size='28' text-anchor='middle' fill='%23ecf2f8' font-family='Arial'%3EN%3C/text%3E%3C/svg%3E" />
   <script src="https://unpkg.com/nkn-sdk@1.3.6/dist/nkn.min.js" defer></script>
@@ -15,11 +15,13 @@
       --ok:#2ecc71; --warn:#f39c12; --bad:#e74c3c; --accent:#4dd0ff; --radius:14px;
     }
     *{box-sizing:border-box; -webkit-tap-highlight-color: transparent;}
-    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;}
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;overscroll-behavior:none}
     a{color:inherit}
-    .qrwrap canvas, .qrwrap img { image-rendering: pixelated; width:auto!important; height:auto!important; max-width:100%; display:block; }
+    .qrwrap canvas, .qrwrap img { image-rendering: pixelated; width:100%!important; height:100%!important; max-width:100%; display:block; }
 
-    /* Header chips scroll horizontally on overflow (mobile) */
+    /* Prevent double-tap zoom on clickable elements */
+    body, button, .btn, a, input, select { touch-action: manipulation; }
+
     header.app .chiprow{
       display:flex; gap:8px; flex:1 1 auto; min-width:0;
       overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap; padding:0 4px;
@@ -64,6 +66,12 @@
     .canvasbox{background:#000; border:1px solid #1b2533; border-radius:12px; overflow:hidden; max-width:640px; width:100%}
     .canvasbox canvas{display:block; width:100%; height:auto}
 
+    /* Dynamic streams grid */
+    .streams-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;width:100%}
+    .stream-card{display:flex;flex-direction:column;gap:6px}
+    .stream-card .label{font-weight:600;font-size:13px;color:var(--muted);display:flex;justify-content:space-between;gap:8px}
+    .stream-card .canvasbox{width:100%}
+
     @media (min-width: 920px){
       main{display:grid; grid-template-columns: 1fr; align-items:start}
       .kv{grid-template-columns:350px 2fr}
@@ -107,12 +115,9 @@
       <div class="content">
         <div class="live-wrap">
           <div class="live-panel" style="flex:1 1 360px; min-width:280px;">
-            <!-- Color -->
-            <div class="canvasbox"><canvas id="liveCanvas" width="640" height="360" aria-label="Color frame"></canvas></div>
-            <div class="small">color fps: <span id="liveFps">0.0</span> • last: <span id="liveMeta">—</span></div>
-            <!-- Depth -->
-            <div class="canvasbox" style="margin-top:8px;"><canvas id="depthCanvas" width="640" height="360" aria-label="Depth frame"></canvas></div>
-            <div class="small">depth: <span id="depthMeta">—</span></div>
+            <!-- Dynamic stream grid -->
+            <div id="streamsGrid" class="streams-grid"></div>
+            <div class="small" id="streamsHint">Waiting for streams…</div>
 
             <!-- Three.js pose viewer -->
             <div class="canvasbox" style="margin-top:8px;"><canvas id="poseCanvas" width="640" height="360" aria-label="Phone pose"></canvas></div>
@@ -125,8 +130,8 @@
           </div>
 
           <div class="live-panel" style="min-width:260px; flex:1 1 300px;">
-            <div><b>Resolution</b> (<span id="resVal">60</span>%)</div>
-            <input id="resSlider" type="range" min="20" max="100" step="5" value="60" />
+            <div><b>Resolution</b> (<span id="resVal">20</span>%)</div>
+            <input id="resSlider" type="range" min="10" max="100" step="5" value="20" />
             <div class="small">Sends <code>/res N%</code> to the selected device.</div>
 
             <div class="row" style="margin-top:10px;">
@@ -161,9 +166,9 @@
         <button class="btn" id="btnSave">Save</button>
       </div>
       <div class="content">
-        <div class="row"><label style="min-width:110px">Label</label><input id="inpLabel" type="text" placeholder="My Phone" /></div>
+        <div class="row"><label style="min-width:110px">Label</label><input id="inpLabel" type="text" placeholder="My Client" /></div>
         <div class="row"><label style="min-width:110px">Seed (64-hex)</label><input id="inpSeed" type="text" placeholder="Auto if empty" /></div>
-        <div class="row"><label style="min-width:110px">Scopes (CSV)</label><input id="inpScopes" type="text" value="video:rgb" /></div>
+        <div class="row"><label style="min-width:110px">Scopes (CSV)</label><input id="inpScopes" type="text" value="video:rgb,video:depth" /></div>
         <div class="row"><label style="min-width:110px">Expiry (minutes)</label><input id="inpExpMin" type="number" value="60" /></div>
         <div class="small">Seed is stored locally; keys are Ed25519 (same for NKN & invite signing).</div>
         <div class="row" style="margin-top:16px;"><button class="btn wide" id="btnRestart">Restart NKN Client</button></div>
@@ -174,7 +179,7 @@
   <!-- QR Modal -->
   <div id="qrModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="qrTitle">
     <div class="box">
-      <div class="head"><div id="qrTitle" style="font-weight:700;">Invite QR</div><button class="btn" id="btnCloseQR">Close</button></div>
+      <div class="head"><div id="qrTitle" style="font-weight:700;">Invite QR (pubkey only)</div><button class="btn" id="btnCloseQR">Close</button></div>
       <div class="body">
         <div class="qrwrap"><div id="qrBox" aria-label="QR code for device pairing"></div></div>
         <div class="small mono" id="qrText" style="word-break:break-all;"></div>
@@ -186,6 +191,22 @@
 
   <!-- Core NKN client + UI logic -->
   <script>
+  // Prevent pinch & double-tap zoom on mobile
+  (function(){
+    let lastTouchEnd = 0;
+    document.addEventListener('touchend', function(e){
+      const now = Date.now();
+      if (now - lastTouchEnd <= 300) { e.preventDefault(); }
+      lastTouchEnd = now;
+    }, {passive:false});
+    ['gesturestart','gesturechange','gestureend'].forEach(type=>{
+      document.addEventListener(type, e=> e.preventDefault(), {passive:false});
+    });
+    document.addEventListener('touchmove', function(e){
+      if (e.scale && e.scale !== 1) e.preventDefault();
+    }, {passive:false});
+  })();
+
   window.addEventListener('DOMContentLoaded', () => {
     const $ = s => document.querySelector(s);
     const enc = new TextEncoder(), dec = new TextDecoder();
@@ -275,63 +296,157 @@
       };
     }
 
-    // Inbound: grant → address book; frames → canvases; ack/stats → status line
-    const canvas = $('#liveCanvas');
-    const ctx = canvas.getContext('2d');
-    const dCanvas = $('#depthCanvas');
-    const dCtx = dCanvas.getContext('2d');
-    let lastDraw = performance.now(), drawCount = 0, fps = 0.0;
-
-    function drawToCanvasFromB64(b64, mime, outCanvas, outCtx){
-      const img = new Image();
-      img.onload = () => {
-        // Fit to container width
-        const cssW = outCanvas.parentElement.clientWidth || 640;
-        const scale = Math.min(1, cssW / img.width);
-        const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
-        outCanvas.width = w; outCanvas.height = h;
-        outCtx.clearRect(0,0,w,h);
-        outCtx.drawImage(img, 0, 0, w, h);
-      };
-      img.src = `data:${mime};base64,` + b64;
+    // ----- Dynamic stream panels (auto-create per stream) -----
+    function drawContained(img, c, x){
+      if (!img) return;
+      x.save();
+      x.clearRect(0,0,c.width,c.height);
+      const scale = Math.min(c.width / img.width, c.height / img.height);
+      const dw = Math.round(img.width * scale);
+      const dh = Math.round(img.height * scale);
+      const dx = Math.floor((c.width - dw)/2);
+      const dy = Math.floor((c.height - dh)/2);
+      x.imageSmoothingEnabled = true;
+      x.imageSmoothingQuality = 'high';
+      x.drawImage(img, dx, dy, dw, dh);
+      x.restore();
     }
 
-    function drawFrameFromBase64(b64){
-      drawToCanvasFromB64(b64, 'image/jpeg', canvas, ctx);
-      const nowp=performance.now();
-      drawCount++;
-      if (nowp - lastDraw >= 1000){
-        fps = drawCount * 1000 / (nowp - lastDraw);
-        drawCount=0; lastDraw=nowp; $('#liveFps').textContent = fps.toFixed(1);
+    const panels = new Map();          // key = `${stype}:${name}` -> panel obj
+    const autoSubs = new Map();        // device -> Set(keys) we already requested
+    const streamsByDevice = {};
+
+    function niceLabel(stype, name, event){
+      if (name) return name.replace(/_/g,' ');
+      if (event === 'frame-color') return 'color';
+      if (event === 'frame-depth') return 'depth';
+      return 'stream';
+    }
+
+    function ensurePanel(key, label, kind){
+      if (panels.has(key)) return panels.get(key);
+      const wrap = document.getElementById('streamsGrid');
+      document.getElementById('streamsHint').style.display = 'none';
+
+      const card = document.createElement('div');
+      card.className = 'stream-card';
+      card.innerHTML = `
+        <div class="label">
+          <span>${label}</span>
+          <span class="small" data-fps>0.0 fps</span>
+        </div>
+        <div class="canvasbox"><canvas width="640" height="360"></canvas></div>
+      `;
+      wrap.appendChild(card);
+
+      const canvas = card.querySelector('canvas');
+      const ctx = canvas.getContext('2d');
+      const obj = {
+        key, label, kind, canvas, ctx,
+        inflight:false, lastImg:null,
+        lastTS: performance.now(), count:0,
+        fpsEl: card.querySelector('[data-fps]')
+      };
+      fitPanelCanvas(obj);
+      panels.set(key, obj);
+      return obj;
+    }
+
+    function fitPanelCanvas(p){
+      const w = p.canvas.parentElement.clientWidth || 640;
+      const h = Math.round(w * (9/16));
+      p.canvas.width = w; p.canvas.height = h;
+      if (p.lastImg) drawContained(p.lastImg, p.canvas, p.ctx);
+    }
+    function resizeAllPanels(){ panels.forEach(fitPanelCanvas); }
+
+    function updateFPS(p){
+      const now = performance.now();
+      p.count++;
+      if (now - p.lastTS >= 1000){
+        const fps = p.count * 1000 / (now - p.lastTS);
+        p.fpsEl.textContent = `${fps.toFixed(1)} fps`;
+        p.count = 0; p.lastTS = now;
       }
     }
 
-    function drawDepthFromBase64(b64){
-      // Expect PNG for depth; if you send JPEG depth, change MIME to image/jpeg
-      drawToCanvasFromB64(b64, 'image/png', dCanvas, dCtx);
+    function drawFrameToPanel(key, label, kind, b64){
+      const p = ensurePanel(key, label, kind);
+      if (p.inflight) return;
+      p.inflight = true;
+      const img = new Image();
+      img.onload = () => {
+        p.inflight = false;
+        p.lastImg = img;
+        drawContained(img, p.canvas, p.ctx);
+        updateFPS(p);
+      };
+      img.onerror = () => { p.inflight = false; };
+      const mime = (kind === 'depth') ? 'png' : 'jpeg';
+      img.src = `data:image/${mime};base64,` + b64;
+    }
+
+    function ensureSubscriptionsFor(device, body){
+      // target these if present
+      const want = new Set(['rs_color','rs_depth','ir_left','ir_right']);
+      const seen = autoSubs.get(device) || new Set();
+      const cand = Array.isArray(body?.candidates) ? body.candidates : Array.from(want);
+
+      for (const name of cand){
+        if (!want.has(name)) continue;
+        const key = `camera:${name}`;
+        if (seen.has(key)) continue;
+        state.dm(device, {event:'cmd', cmd:`get camera ${name}`});
+        seen.add(key);
+      }
+      autoSubs.set(device, seen);
     }
 
     function handleInbound(src, body){
       if (!body || typeof body!=='object') return;
+
       if (body.type==='grant' && body.grant && body.grant.token){
         const g = body.grant;
         BOOK.add({ device: g.device || 'device', token: g.token, scopes: g.scopes || [], exp: g.exp || 0, receivedAt: Math.floor(Date.now()/1000), from: src });
         toast('Grant received');
-      } else if (body.event === 'frame-color' && body.data){
-        $('#liveMeta').textContent = `from ${src}`;
-        drawFrameFromBase64(body.data);
-      } else if (body.event === 'frame-depth' && body.data){
-        $('#depthMeta').textContent = `from ${src}`;
-        drawDepthFromBase64(body.data);
+
+      } else if ((body.event === 'frame-color' || body.event === 'frame-depth') && body.data){
+        const st = (body.stype || 'camera');
+        const nm = (body.name  || (body.event === 'frame-color' ? 'rs_color' : 'rs_depth'));
+        const key = `${st}:${nm}`;
+        const label = niceLabel(st, nm, body.event);
+        const kind  = (body.event === 'frame-depth') ? 'depth' : 'color';
+        drawFrameToPanel(key, label, kind, body.data);
+
+      } else if (typeof body.event === 'string' && /^frame-(camera|video)-/.test(body.event) && body.data){
+        const name = body.event.split('-').slice(2).join('-');
+        const isDepthLike = /depth|^rs_depth$|ir/i.test(name);
+        if (isDepthLike){
+          depthUI.from = src;
+          renderDepthMeta();
+          drawDepthFromBase64(body.data);
+        } else {
+          $('#liveMeta').textContent = `from ${src}`;
+          drawColorFromBase64(body.data);
+        }
+      } else if (body.event === 'streams'){
+        streamsByDevice[src] = body;
+        const bits = [];
+        if (body?.color?.topic) bits.push(`colorTopic:${body.color.topic}`);
+        if (body?.depth?.topic) bits.push(`depthTopic:${body.depth.topic}`);
+        if (bits.length) $('#kvReady').textContent = 'ready • ' + bits.join(' • ');
+        ensureSubscriptionsFor(src, body);
+
       } else if (body.event === 'ack' || body.event === 'cmd-ack'){
         const ok = body.ok ? '✓' : '✗';
         const msg = body.note || body.msg || '';
         $('#cmdAck').textContent = `${ok} ${msg}`;
+
       } else if (body.event === 'stats'){
         const s = body;
         $('#cmdAck').textContent = `fps_out=${s.fps_out} size=${s.jpeg_bytes} w=${s.w} h=${s.h}`;
+
       } else if (body.event === 'hello'){
-        // presence handshake (optional)
         window.NKN?.sendRaw({event:'hello-ack'});
       }
     }
@@ -341,7 +456,7 @@
       const cfg = LS.read();
       $('#inpLabel').value  = cfg.label || 'My Client';
       $('#inpSeed').value   = cfg.seedHex || '';
-      $('#inpScopes').value = cfg.scopes || 'video:rgb';
+      $('#inpScopes').value = cfg.scopes || 'video:rgb,video:depth';
       $('#inpExpMin').value = cfg.expMin || 60;
       const { seedHex, pubHex } = seedHexToKeyPair(cfg.seedHex||'');
       $('#kvLabel').textContent = cfg.label || 'My Client';
@@ -354,7 +469,7 @@
       const s   = ($('#inpSeed').value||'').trim().toLowerCase().replace(/^0x/,'');
       if (s && !looksHex64(s)){ alert('Seed must be 64 hex'); return; }
       cfg.seedHex = s || cfg.seedHex || '';
-      cfg.scopes  = ($('#inpScopes').value || 'video:rgb').trim();
+      cfg.scopes  = ($('#inpScopes').value || 'video:rgb,video:depth').trim();
       cfg.expMin  = Math.max(1, parseInt($('#inpExpMin').value||'60',10));
       LS.write(cfg);
       loadSettingsIntoUI();
@@ -400,21 +515,15 @@
       }
     }
 
+    // ---- MINIMAL INVITE: PubKey-only (43 chars base64url) ----
     function showInviteQR(){
       const cfg = LS.read();
       const { kp } = seedHexToKeyPair(cfg.seedHex||'');
-      const clientPubB64u = b64u.enc(kp.publicKey);
-      const scopesShort = 'r'; // "video:rgb"
-      const expSec = Math.floor(Date.now()/1000) + (Math.max(1, cfg.expMin||60)*60);
-      const exp36 = expSec.toString(36);
-      const nonce = crypto.getRandomValues(new Uint8Array(12));
-      const canonical = `2|${clientPubB64u}|${scopesShort}|${exp36}|${b64u.enc(nonce)}`;
-      const sig = nacl.sign.detached(enc.encode(canonical), kp.secretKey);
-      const url = `nkn+invite:v=2&a=${encodeURIComponent(clientPubB64u)}&s=${scopesShort}&e=${exp36}&n=${encodeURIComponent(b64u.enc(nonce))}&g=${encodeURIComponent(b64u.enc(sig))}&i=client`;
-
+      const pubB64u = b64u.enc(kp.publicKey); // 32 bytes -> 43 chars
+      const text = pubB64u;                   // bare minimum: pubkey only
       const box = $('#qrBox'); box.innerHTML='';
-      new QRCode(box, { text: url, width: 336, height: 336, correctLevel: QRCode.CorrectLevel.M });
-      $('#qrText').textContent = url;
+      new QRCode(box, { text, width: 160, height: 160, correctLevel: QRCode.CorrectLevel.L });
+      $('#qrText').textContent = text;
       $('#qrModal').style.display='flex';
     }
 
@@ -450,25 +559,18 @@
     $('#btnStatsOnce').onclick = ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {event:'cmd', cmd:'/stats once'}); };
     $('#btnStatsToggle').onclick= ()=>{ if(!state.targetDevice) return; state.dm(state.targetDevice, {event:'cmd', cmd:'/stats'}); };
 
-    // Events
+    // Layout / resize — resize all dynamic panels
+    function onResize(){ resizeAllPanels(); }
+    window.addEventListener('resize', onResize, {passive:true});
+    onResize(); // initial size
+
+    // Settings & boot
     $('#btnSettings').onclick = () => document.querySelector('#secSettings').scrollIntoView({behavior:'smooth'});
     $('#btnSave').onclick = saveSettingsFromUI;
     $('#btnRestart').onclick = startOrRestart;
     $('#btnShowQR').onclick = showInviteQR;
     $('#btnCloseQR').onclick = () => { $('#qrModal').style.display='none'; };
     $('#btnClearBook').onclick = () => { if (confirm('Clear all grants?')) { BOOK.clear(); renderDeviceSelect(); } };
-
-    // Boot
-    function onResize(){ // keep canvases fitting container on rotate
-      const fit = (c)=>{
-        const w = c.parentElement.clientWidth || 640;
-        const h = Math.round(w * (9/16));
-        c.width = w; c.height = h;
-      };
-      fit(canvas); fit(dCanvas);
-    }
-    window.addEventListener('resize', onResize, {passive:true});
-    onResize();
 
     loadSettingsIntoUI();
     renderBook();
@@ -589,7 +691,10 @@
       if (a) accel = { x: a.x || 0, y: a.y || 0, z: a.z || 0 };
     }, true);
 
-    btnCenter.addEventListener('click', () => { baseQuat = curQuat.clone(); });
+    btnCenter.addEventListener('click', () => {
+      baseQuat = curQuat.clone();
+      window.NKN?.toast?.('Centered');
+    });
 
     // Orientation streaming toggle
     let orientOn = false;
@@ -606,7 +711,7 @@
       trans.Y = clamp(decay(trans.Y + ( accel.x*10)), -400, 400);  // left/right
 
       const { yaw:yDeg, pitch:pDeg, roll:rDeg } = getRelativeYPRDeg();
-      const X = clamp(-yDeg * GAIN_YAW,   -400, 400);
+      const X = clamp(-yDeg * GAIN_YAW,   -400, 400) * -1;
       const P = clamp( pDeg * GAIN_PITCH, -400, 400);
       const R = clamp( rDeg * GAIN_ROLL,  -400, 400);
       const H = clamp(trans.H, 0, 50);
@@ -618,7 +723,7 @@
       if (!window.NKN?.hasTarget?.()) return;
       const cmd = makeCommand();
       window.NKN.sendCmd(cmd);
-      // (optional) surface briefly in UI without spamming
+      // surface briefly in UI without spamming
       const ack = document.getElementById('cmdAck');
       if (ack && Math.random() < 0.07) ack.textContent = `→ ${cmd}`;
     }

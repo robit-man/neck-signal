@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-app.py — NKN QR handshake, presence, prioritized command topic, color+depth streams, serial control + live previews.
+NKN device — unified multi-stream pipeline (QR from /camera/rs_color, streams default to /video)
 
-What's in here:
-- Dual capture: COLOR_URL (alias VIDEO_URL) + optional DEPTH_URL.
-- Auto-detects OpenCV-friendly streams; otherwise falls back to a robust MJPEG parser.
-- Streams via DM (always) and Topic (if ENABLE_TOPICS=1):
-    * color: {event:"frame-color", data:<b64 JPEG>, w, h, uuid, seq, ts}
-    * depth: {event:"frame-depth", data:<b64 PNG>,  w, h, uuid, seq, ts}
-- Announces capabilities via {event:"streams", ...} including per-channel topics:
-    * color.topic = <TOPIC_PREFIX>.rgb.<DEVICE_UUID>
-    * depth.topic = <TOPIC_PREFIX>.depth.<DEVICE_UUID>
-- Per-peer pacing/coalescing. /res affects RGB only; depth has DEPTH_SCALE (global).
-- Commands via topic (low-latency) or DM (fallback). Node sidecar handles subscribe.
+WHAT'S NEW (frontend-compat + shorter QR):
+- Accepts SHORT INVITES: just the client's public key (base64url 43 chars), also accepts 64-hex or "identifier.hex".
+- Still accepts legacy "nkn+invite:" v1/v2.
+- On short invite, grants default scopes (configurable) and default expiry (configurable), DMs grant to "client.<pubhex>".
+- Emits frames with events your frontend expects:
+    * Color  → {"event":"frame-color", "data":"<jpeg b64>", ...}
+    * Depth  → {"event":"frame-depth", "data":"<png  b64>", ...}
+- The periodic "streams" message now also includes a summary:
+    {"event":"streams", "color":{"topic":...}, "depth":{"topic":...}, ...}
 
-Updates in this build:
-- Depth preview window (normalized grayscale) with FPS overlay to verify it's live.
-- Console log whenever /res changes: prints address and new percent.
-- Symmetric color/depth streaming, distinct topics, seq/ts to defeat caching.
-- Orientation UI "Center" (or /center) maps to HOME.
+Other behavior preserved:
+- Baseline camera/rs_color runs for QR scanning; green overlay boxes for detected invites also rendered in color frames.
+- Commands: get/stop streams, /res N%, /stats on|off|hz, /home & serial passthrough with validation.
 """
 
 # ──────────────────────────────────────────────────────────────────────
 # 0) venv bootstrap (stdlib)
 # ──────────────────────────────────────────────────────────────────────
-import os, sys, subprocess, json, time, threading, base64, re, signal
+import os, sys, subprocess, json, time, threading, base64, re, signal, shutil
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -53,27 +50,30 @@ if not _in_venv():
 # 1) imports (inside venv)
 # ──────────────────────────────────────────────────────────────────────
 import argparse
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Set
 import urllib.parse
 import requests
 import numpy as np
 import cv2
 import secrets
 import uuid as _uuid
-import shutil
 from subprocess import Popen, PIPE
 from nacl.signing import SigningKey, VerifyKey
 import serial  # pyserial
+
+def _log(*a):
+    try: print(*a, flush=True)
+    except Exception: pass
 
 # ──────────────────────────────────────────────────────────────────────
 # 2) args & .env
 # ──────────────────────────────────────────────────────────────────────
 cli = argparse.ArgumentParser()
-cli.add_argument("--video-url", default=os.environ.get("VIDEO_URL", os.environ.get("COLOR_URL", "http://127.0.0.1:8080/video/rs_color")))
+cli.add_argument("--video-url", default=os.environ.get("VIDEO_URL", "http://127.0.0.1:8080/video/rs_color"))
 cli.add_argument("--color-url", default=os.environ.get("COLOR_URL", None))
-cli.add_argument("--depth-url", default=os.environ.get("DEPTH_URL", ""))
-cli.add_argument("--stream-hz", type=int, default=int(os.environ.get("STREAM_HZ", os.environ.get("COLOR_HZ","24"))))
-cli.add_argument("--depth-hz",  type=int, default=int(os.environ.get("DEPTH_HZ","10")))
+cli.add_argument("--depth-url", default=os.environ.get("DEPTH_URL", ""))  # legacy hint; discovery will also find it
+cli.add_argument("--stream-hz", type=int, default=int(os.environ.get("STREAM_HZ","24")))
+cli.add_argument("--camera-hz", type=int, default=int(os.environ.get("CAMERA_HZ","10")))
 cli.add_argument("--scan-max-width", type=int, default=int(os.environ.get("SCAN_MAX_WIDTH", "960")))
 cli.add_argument("--label", default=os.environ.get("DEVICE_LABEL","neck-agent"))
 cli.add_argument("--uuid", default=os.environ.get("DEVICE_UUID",""))
@@ -83,8 +83,17 @@ cli.add_argument("--enable-topics", type=int, default=int(os.environ.get("ENABLE
 cli.add_argument("--cmd-topic-strategy", default=os.environ.get("CMD_TOPIC_STRATEGY","uuid"), choices=["uuid","pubhex"])
 cli.add_argument("--cmd-topic-duration", type=int, default=int(os.environ.get("CMD_TOPIC_DURATION","4320")))
 cli.add_argument("--jpeg-quality", type=int, default=int(os.environ.get("JPEG_QUALITY","65")))
-cli.add_argument("--depth-scale", type=float, default=float(os.environ.get("DEPTH_SCALE","0.6")))
 cli.add_argument("--max-b64", type=int, default=int(os.environ.get("MAX_B64","900000")))
+# include IR candidates and depth by default
+cli.add_argument("--stream-candidates", default=os.environ.get("STREAM_CANDIDATES","rs_color,rs_depth,rs_ir_left,rs_ir_right"))
+cli.add_argument("--camera-base", default=os.environ.get("CAMERA_BASE",""))
+cli.add_argument("--video-base",  default=os.environ.get("VIDEO_BASE",""))
+# baseline for QR lives on camera
+cli.add_argument("--always-on",   default=os.environ.get("ALWAYS_ON","camera:rs_color"))
+
+# NEW: Defaults for short-invite grants
+cli.add_argument("--default-scopes-short", default=os.environ.get("DEFAULT_SCOPES_SHORT","rd"))   # r=color rgb, d=depth
+cli.add_argument("--default-invite-min", type=int, default=int(os.environ.get("DEFAULT_INV_MIN","60")))
 args = cli.parse_args()
 
 ENV_PATH = BASE_DIR / ".env"
@@ -101,22 +110,18 @@ def _save_env(path: Path, env: Dict[str, str]) -> None:
     path.write_text(body)
 
 dotenv = _load_env(ENV_PATH)
-if "DEVICE_SEED_HEX" not in dotenv:
-    dotenv["DEVICE_SEED_HEX"] = secrets.token_hex(32)
-if "DEVICE_TOPIC_PREFIX" not in dotenv:
-    dotenv["DEVICE_TOPIC_PREFIX"] = "roko-signaling"
-if "REV_COUNTER" not in dotenv:
-    dotenv["REV_COUNTER"] = "0"
+if "DEVICE_SEED_HEX" not in dotenv: dotenv["DEVICE_SEED_HEX"] = secrets.token_hex(32)
+if "DEVICE_TOPIC_PREFIX" not in dotenv: dotenv["DEVICE_TOPIC_PREFIX"] = "roko-signaling"
+if "REV_COUNTER" not in dotenv: dotenv["REV_COUNTER"] = "0"
 
-# normalize config
+# Normalize legacy hints
 color_url = args.color_url or args.video_url or dotenv.get("COLOR_URL") or dotenv.get("VIDEO_URL") or "http://127.0.0.1:8080/video/rs_color"
 
 dotenv["VIDEO_URL"]      = color_url
 dotenv["COLOR_URL"]      = color_url
 dotenv["DEPTH_URL"]      = args.depth_url or dotenv.get("DEPTH_URL","")
 dotenv["STREAM_HZ"]      = str(max(1, min(60, int(args.stream_hz))))
-dotenv["COLOR_HZ"]       = dotenv["STREAM_HZ"]
-dotenv["DEPTH_HZ"]       = str(max(1, min(60, int(args.depth_hz))))
+dotenv["CAMERA_HZ"]      = str(max(1, min(60, int(args.camera_hz))))
 dotenv["SCAN_MAX_WIDTH"] = str(max(0, min(2560, int(args.scan_max_width))))
 dotenv["DEVICE_UUID"]    = args.uuid or dotenv.get("DEVICE_UUID") or str(_uuid.uuid4())
 dotenv["SUBCLIENTS"]     = str(max(1, min(16, int(args.subclients))))
@@ -125,17 +130,24 @@ dotenv["ENABLE_TOPICS"]  = "1" if int(args.enable_topics) else "0"
 dotenv["CMD_TOPIC_STRATEGY"] = args.cmd_topic_strategy
 dotenv["CMD_TOPIC_DURATION"] = str(max(60, int(args.cmd_topic_duration)))
 dotenv["JPEG_QUALITY"]   = str(max(30, min(95, int(args.jpeg_quality))))
-dotenv["DEPTH_SCALE"]    = str(max(0.1, min(1.0, float(args.depth_scale))))
 dotenv["MAX_B64"]        = str(max(200000, int(args.max_b64)))
+dotenv["STREAM_CANDIDATES"] = args.stream_candidates
+dotenv["CAMERA_BASE"]    = args.camera_base or dotenv.get("CAMERA_BASE","")
+dotenv["VIDEO_BASE"]     = args.video_base  or dotenv.get("VIDEO_BASE","")
+# 👇 baseline lives on /camera for QR
+dotenv["ALWAYS_ON"]      = args.always_on
+
+# NEW defaults for short-invite
+dotenv["DEFAULT_SCOPES_SHORT"] = args.default_scopes_short
+dotenv["DEFAULT_INV_MIN"]      = str(max(1, int(args.default_invite_min)))
+
 _save_env(ENV_PATH, dotenv)
 
 DEVICE_SEED_HEX = dotenv["DEVICE_SEED_HEX"].lower().replace("0x","")
 TOPIC_PREFIX    = dotenv["DEVICE_TOPIC_PREFIX"]
 REV_COUNTER     = int(dotenv["REV_COUNTER"])
-COLOR_URL       = dotenv["COLOR_URL"]
-DEPTH_URL       = dotenv.get("DEPTH_URL","")
-COLOR_HZ        = max(1, min(60, int(dotenv["COLOR_HZ"])))
-DEPTH_HZ        = max(1, min(60, int(dotenv["DEPTH_HZ"])))
+STREAM_HZ       = max(1, min(60, int(dotenv["STREAM_HZ"])))
+CAMERA_HZ       = max(1, min(60, int(dotenv["CAMERA_HZ"])))
 SCAN_MAX_WIDTH  = max(0, min(2560, int(dotenv["SCAN_MAX_WIDTH"])))
 DEVICE_UUID     = dotenv["DEVICE_UUID"]
 DEVICE_LABEL    = args.label
@@ -147,16 +159,31 @@ CMD_TOPIC_DURATION = max(60, int(dotenv.get("CMD_TOPIC_DURATION","4320")))
 NKN_WALLET_SEED = os.environ.get("NKN_WALLET_SEED", DEVICE_SEED_HEX)
 NKN_RPC_SERVER  = os.environ.get("NKN_RPC_SERVER","")
 JPEG_QUALITY    = max(30, min(95, int(dotenv["JPEG_QUALITY"])))
-DEPTH_SCALE     = max(0.1, min(1.0, float(dotenv["DEPTH_SCALE"])))
 MAX_B64         = max(200000, int(dotenv.get("MAX_B64","900000")))
+STREAM_CANDIDATES = [s.strip() for s in dotenv["STREAM_CANDIDATES"].split(",") if s.strip()]
+CAMERA_BASE     = dotenv["CAMERA_BASE"] or "http://127.0.0.1:8080"
+VIDEO_BASE      = dotenv["VIDEO_BASE"]  or "http://127.0.0.1:8080"
+ALWAYS_ON_CONF  = [s.strip() for s in (dotenv.get("ALWAYS_ON","camera:rs_color") or "").split(",") if s.strip()]
 
-# flags + topics
-HAS_DEPTH = False
-COLOR_TOPIC = f"{TOPIC_PREFIX}.rgb.{DEVICE_UUID}"
-DEPTH_TOPIC = f"{TOPIC_PREFIX}.depth.{DEVICE_UUID}"
+DEFAULT_SCOPES_SHORT = (dotenv.get("DEFAULT_SCOPES_SHORT","rd") or "rd")
+DEFAULT_INV_MIN      = max(1, int(dotenv.get("DEFAULT_INV_MIN","60")))
+
+def _derive_base(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        if not u.scheme or not u.netloc: return ""
+        return f"{u.scheme}://{u.netloc}"
+    except Exception:
+        return ""
+
+if not dotenv["CAMERA_BASE"] and dotenv.get("DEPTH_URL"):
+    CAMERA_BASE = _derive_base(dotenv["DEPTH_URL"]) or CAMERA_BASE
+if not dotenv["VIDEO_BASE"] and dotenv.get("VIDEO_URL"):
+    VIDEO_BASE = _derive_base(dotenv["VIDEO_URL"]) or VIDEO_BASE
 
 # ──────────────────────────────────────────────────────────────────────
-# 3) NKN bridge (Node sidecar)
+# 3) NKN bridge (Node sidecar, packet-friendly)
 # ──────────────────────────────────────────────────────────────────────
 NODE_DIR = BASE_DIR / "device-bridge"
 NODE_BIN = shutil.which("node")
@@ -169,12 +196,15 @@ BRIDGE_JS = NODE_DIR / "nkn_device_bridge.js"
 NODE_DIR.mkdir(exist_ok=True)
 
 if not PKG_JSON.exists():
-    print("→ Initializing device-bridge …")
+    _log("→ Initializing device-bridge …")
     subprocess.check_call([NPM_BIN, "init", "-y"], cwd=NODE_DIR, stdout=subprocess.DEVNULL)
     subprocess.check_call([NPM_BIN, "install", "nkn-sdk@^1.3.6"], cwd=NODE_DIR, stdout=subprocess.DEVNULL)
 
 BRIDGE_SRC = r"""
-/* nkn_device_bridge.js — MultiClient DM + optional topic subscribe/publish. */
+/* nkn_device_bridge.js — MultiClient DM + optional topic subscribe/publish.
+   Fire-and-forget path: if outbound has {no_ack:1}, we don't block on ACKs (we still use client.send()).
+   Inbound: if {no_ack:1}, return false to suppress SDK ACK.
+*/
 const nkn = require('nkn-sdk');
 const readline = require('readline');
 
@@ -188,12 +218,12 @@ const TOPIC_DUR  = Math.max(60, parseInt(process.env.CMD_TOPIC_DURATION || '4320
 const RPC        = process.env.NKN_RPC_SERVER || '';
 const WALLET_SEED= (process.env.NKN_WALLET_SEED || SEED_HEX).toLowerCase().replace(/^0x/,'');
 
-function sendToPy(obj){ process.stdout.write(JSON.stringify(obj) + '\n'); }
+function sendToPy(obj){ try{ process.stdout.write(JSON.stringify(obj) + '\n'); }catch(_){} }
 function isFullAddr(s){ return typeof s === 'string' && /^[A-Za-z0-9_-]+\.[0-9a-f]{64}$/i.test((s||'').trim()); }
 function isHex64(s){ return typeof s === 'string' && /^[0-9a-f]{64}$/i.test((s||'').trim()); }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-async function sendDMWithRetry(client, dest, data, tries=2){
+async function sendDMReliable(client, dest, data, tries=2){
   if (!isFullAddr(dest) && !isHex64(dest)) return false;
   const body = JSON.stringify(data);
   const t = Math.max(1, Math.min(3, parseInt(tries || 2, 10)));
@@ -202,6 +232,12 @@ async function sendDMWithRetry(client, dest, data, tries=2){
     catch(e){ await sleep(20); }
   }
   return false;
+}
+
+function sendDMFire(client, dest, data){
+  if (!isFullAddr(dest) && !isHex64(dest)) return false;
+  try { client.send(dest, JSON.stringify(data)).catch(()=>{}); } catch(_) {}
+  return true;
 }
 
 function parseInboundPayload(a,b){
@@ -227,7 +263,7 @@ function parseInboundPayload(a,b){
   let wallet = null;
   if (ENABLE_TOPICS) {
     try {
-      wallet = new nkn.Wallet({ seed: WALLET_SEED, rpcServer: RPC || undefined });
+      wallet = new nkn.Wallet({ seed: WALLET_SEED, rpcServerAddr: RPC || undefined });
       client.wallet = wallet;
     } catch (e) {
       sendToPy({ type:'topics-error', error: String(e) });
@@ -251,6 +287,7 @@ function parseInboundPayload(a,b){
   client.on('message', (a,b) => {
     const { src, topic, msg } = parseInboundPayload(a,b);
     sendToPy({ type:'message', src, topic: topic || null, msg });
+    if (msg && (msg.no_ack === 1 || msg.no_ack === true)) return false;
   });
 
   const rl = readline.createInterface({ input: process.stdin });
@@ -258,7 +295,11 @@ function parseInboundPayload(a,b){
     if (!line) return;
     let cmd; try { cmd = JSON.parse(line); } catch { return; }
     if (cmd.type === 'dm') {
-      await sendDMWithRetry(client, String(cmd.to||'').trim(), cmd.data, cmd.tries || 2);
+      if (cmd.fire) {
+        sendDMFire(client, String(cmd.to||'').trim(), cmd.data);
+      } else {
+        await sendDMReliable(client, String(cmd.to||'').trim(), cmd.data, cmd.tries || 2);
+      }
     } else if (cmd.type === 'pub') {
       if (cmd.topic) { try { await client.publish(String(cmd.topic), JSON.stringify(cmd.data)); } catch {} }
     }
@@ -272,11 +313,12 @@ def _cmd_topic_name(device_pubhex: str) -> str:
     return f"{TOPIC_PREFIX}.cmd.{DEVICE_UUID}" if CMD_TOPIC_STRATEGY=="uuid" else f"{TOPIC_PREFIX}.cmd.{device_pubhex}"
 
 # crypto helpers
-def b64url_encode(b: bytes) -> str: return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+import base64 as _b64
+def b64url_encode(b: bytes) -> str: return _b64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
 def b64url_decode(s: str) -> bytes:
     s = (s or "").strip().replace(" ", "+")
     pad = '=' * ((4 - len(s) % 4) % 4)
-    return base64.urlsafe_b64decode(s + pad)
+    return _b64.urlsafe_b64decode(s + pad)
 
 def load_device_keys(seed_hex: str) -> Tuple[SigningKey, str]:
     seed = bytes.fromhex(seed_hex)
@@ -324,10 +366,10 @@ def _bridge_send(obj: dict):
     try:
         bridge.stdin.write(json.dumps(obj) + "\n"); bridge.stdin.flush()
     except Exception as e:
-        print("bridge send error:", e)
+        _log("bridge send error:", e)
 
-def _dm(dest: str, data: dict, tries: int = 2):
-    _bridge_send({"type":"dm","to":dest,"data":data,"tries":tries})
+def _dm(dest: str, data: dict, tries: int = 2, *, fire: bool = False):
+    _bridge_send({"type":"dm","to":dest,"data":data,"tries":tries,"fire": bool(fire)})
 
 def _pub(topic: str, data: dict):
     if ENABLE_TOPICS:
@@ -337,44 +379,36 @@ def _shutdown(*_):
     try:
         if bridge and bridge.poll() is None:
             bridge.terminate()
-    except Exception:
-        pass
+    except Exception: pass
+    try: cv2.destroyAllWindows()
+    except Exception: pass
     try:
-        cv2.destroyAllWindows()
-    except Exception:
-        pass
-    try:
-        if ser is not None and ser.is_open:
-            ser.close()
-    except Exception:
-        pass
+        if ser is not None and ser.is_open: ser.close()
+    except Exception: pass
     sys.exit(0)
 
 def _bridge_reader():
     for line in bridge.stdout:
         line = (line or "").strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except Exception:
-            continue
+        if not line: continue
+        try: msg = json.loads(line)
+        except Exception: continue
         t = msg.get("type")
         if t == "ready":
             state["client_address"] = msg.get("address")
             state["topic_prefix"]   = msg.get("topicPrefix") or TOPIC_PREFIX
             state["subs"]           = int(msg.get("subs") or SUBCLIENTS)
-            print(f"→ NKN ready: {state['client_address']}  subs={state['subs']}")
+            _log(f"→ NKN ready: {state['client_address']}  subs={state['subs']}")
             for addr in list(addresses.keys()):
-                _dm(addr, {"event":"hello","from": state["client_address"], "uuid": DEVICE_UUID})
+                _dm(addr, {"event":"hello","from": state["client_address"], "uuid": DEVICE_UUID}, fire=False)
                 send_stream_info(addr, force=True)
         elif t == "topics-ready":
             state["topics_ready"] = True
             state["cmd_topic"]    = msg.get("cmdTopic") or CMD_TOPIC
-            print(f"→ topics: ready, cmd_topic={state['cmd_topic']}, duration={msg.get('duration')}")
+            _log(f"→ topics: ready, cmd_topic={state['cmd_topic']}, duration={msg.get('duration')}")
         elif t == "topics-error":
             state["topics_ready"] = False
-            print("→ topics: disabled/fallback:", msg.get("error",""))
+            _log("→ topics: disabled/fallback:", msg.get("error",""))
         elif t == "message":
             src = (msg.get("src") or "").strip()
             payload = msg.get("msg")
@@ -382,7 +416,7 @@ def _bridge_reader():
             try:
                 handle_inbound(src, payload, topic=topic)
             except Exception as e:
-                print("inbound handler error:", e)
+                _log("inbound handler error:", e)
 
 def _bridge_err():
     for line in bridge.stderr:
@@ -418,11 +452,11 @@ def _ensure_peer(addr: str, *, default_scale: float = 1.0) -> Dict[str, Any]:
             "last_tick_ts": time.time(),
             "online": False,
             "last_online": 0.0,
-            "last_color_ts": 0.0,
-            "last_depth_ts": 0.0,
             "last_info_ts": 0.0,
+            "subs": set(),  # {(type,name)}
         }
         peers[addr] = st
+    if "subs" not in st: st["subs"] = set()
     return st
 
 def _persist_peer(addr: str, label: str, scopes: List[str], exp: int, device: str, *, scale: float = 1.0):
@@ -444,17 +478,16 @@ SER_POSSIBLE = ["/dev/ttyUSB0","/dev/ttyUSB1","/dev/tty0","/dev/tty1","COM3","CO
 ser: Optional[serial.Serial] = None
 def _open_serial():
     global ser
-    if ser is not None and ser.is_open:
-        return
+    if ser is not None and ser.is_open: return
     for p in SER_POSSIBLE:
         try:
             ser = serial.Serial(p, 115200, timeout=1)
-            print("[serial] opened:", p)
+            _log("[serial] opened:", p)
             break
         except Exception:
             ser = None
     if ser is None:
-        print("[serial] no device found (commands will still be ACKed)")
+        _log("[serial] no device found (commands will still be ACKed)")
 _open_serial()
 
 ALLOWED = {"X": (-700,700,int),"Y":(-700,700,int),"Z":(-700,700,int),
@@ -492,11 +525,11 @@ def _serial_send(full:str)->bool:
             ser.write((full+"\n").encode())
             return True
     except Exception as e:
-        print("[serial] error:", e)
+        _log("[serial] error:", e)
     return False
 
 # ──────────────────────────────────────────────────────────────────────
-# 7) capture helpers (OpenCV + MJPEG fallback)
+# 7) capture helpers
 # ──────────────────────────────────────────────────────────────────────
 class LatestFrameGrabber:
     def __init__(self, url: str):
@@ -526,7 +559,7 @@ class LatestFrameGrabber:
 
     def read(self) -> Optional[np.ndarray]:
         with self._lock:
-            return self._latest
+            return None if self._latest is None else self._latest.copy()
 
     def stop(self):
         self._stopped.set()
@@ -541,8 +574,7 @@ class MJPEGGrabber:
         self.url = url
         self.timeout = timeout
         self._lock = threading.Lock()
-        a = None
-        self._latest: Optional[np.ndarray] = a
+        self._latest: Optional[np.ndarray] = None
         self._stopped = threading.Event()
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._t.start()
@@ -604,48 +636,77 @@ class MJPEGGrabber:
 
     def read(self) -> Optional[np.ndarray]:
         with self._lock:
-            return self._latest
+            return None if self._latest is None else self._latest.copy()
 
     def stop(self):
         self._stopped.set()
         try: self._t.join(timeout=0.5)
         except Exception: pass
 
-class AutoGrabber:
-    def __init__(self, url: str):
+class SingleImagePoller:
+    """Polls a single-image HTTP endpoint (e.g., /camera/rs_depth) at a fixed rate."""
+    def __init__(self, url: str, hz: int = 10, timeout=6.0):
         self.url = url
-        self.impl = None
-        self.kind = "unknown"
-        try:
-            self.impl = LatestFrameGrabber(url); self.kind = "opencv"
-        except Exception:
-            self.impl = MJPEGGrabber(url); self.kind = "mjpeg"
+        self.period = 1.0 / max(1, hz)
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._latest: Optional[np.ndarray] = None
+        self._stopped = threading.Event()
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def _loop(self):
+        sess = requests.Session()
+        headers = {"Cache-Control": "no-cache", "Pragma": "no-cache", "Accept": "image/*"}
+        while not self._stopped.is_set():
+            t0 = time.time()
+            try:
+                resp = sess.get(self.url, headers=headers, params={"_ts": int(time.time()*1000)}, timeout=self.timeout)
+                if resp.status_code == 200 and resp.content:
+                    arr = np.frombuffer(resp.content, dtype=np.uint8)
+                    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)  # preserve 16-bit if present
+                    if img is not None:
+                        with self._lock:
+                            self._latest = img
+            except Exception:
+                pass
+            dt = time.time() - t0
+            sleep_left = self.period - dt
+            if sleep_left > 0: time.sleep(sleep_left)
+
     def read(self) -> Optional[np.ndarray]:
-        return None if not self.impl else self.impl.read()
+        with self._lock:
+            return None if self._latest is None else self._latest.copy()
+
     def stop(self):
-        if self.impl:
-            try: self.impl.stop()
-            except Exception: pass
+        self._stopped.set()
+        try: self._t.join(timeout=0.5)
+        except Exception: pass
 
-# helpers
-def resize_keep_aspect(img: np.ndarray, max_w: int) -> Tuple[np.ndarray, float]:
-    if max_w <= 0: return img, 1.0
-    h, w = img.shape[:2]
-    if w <= max_w: return img, 1.0
-    new_w = max_w
-    new_h = int(round(h * (new_w / w)))
-    out = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    scale = w / float(new_w)
-    return out, scale
+def make_grabber(url: str, hz_for_camera: int, hz_for_video: int):
+    u = url.lower()
+    try:
+        pr = requests.head(url, timeout=3.0)
+        ctype = (pr.headers.get("Content-Type","") or "").lower()
+    except Exception:
+        ctype = ""
 
-def draw_polys(img: np.ndarray, polys: List[np.ndarray], color=(0, 255, 0)):
-    if not polys: return
-    for p in polys:
-        pts = np.asarray(p, dtype=np.int32).reshape(-1, 2)
-        cv2.polylines(img, [pts], True, color, 2, cv2.LINE_AA)
+    if "/camera/" in u or (ctype.startswith("image/") and "multipart" not in ctype):
+        g = SingleImagePoller(url, hz=hz_for_camera); g.kind = "single-image"; return g, "camera"
+    if "/video/" in u or "multipart" in ctype:
+        try:
+            g = MJPEGGrabber(url); g.kind = "mjpeg"; return g, "video"
+        except Exception:
+            pass
+    if "/video/" in u:
+        try:
+            g = LatestFrameGrabber(url); g.kind = "opencv"; return g, "video"
+        except Exception:
+            pass
+    g = SingleImagePoller(url, hz=hz_for_camera); g.kind = "single-image"; return g, "camera"
 
 # ──────────────────────────────────────────────────────────────────────
-# 8) encoding + utils
+# 8) encoding + utils + overlay helpers
 # ──────────────────────────────────────────────────────────────────────
 def _encode_jpeg_bgr(bgr: np.ndarray, quality: int = 65) -> Tuple[Optional[str], int, int, int]:
     try:
@@ -675,7 +736,11 @@ def _to_gray8(img: np.ndarray) -> Optional[np.ndarray]:
         if img.dtype != np.uint8:
             return cv2.convertScaleAbs(img)
         return img
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if img.ndim == 3 and img.shape[2] == 3:
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if img.ndim == 3 and img.shape[2] == 4:
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+    return None
 
 def _u16_to_u8_auto(d16: np.ndarray, lo_p=0.01, hi_p=0.99) -> np.ndarray:
     v = d16[d16 > 0]
@@ -713,43 +778,311 @@ def _fit_b64_png_by_res(gray8: np.ndarray, max_b64: int, min_wh: int = 64) -> Tu
             return b64, raw_bytes, w, h
         img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
 
-def grant_for(client_pub_hex: str, scopes_list: List[str], exp_unix: int) -> dict:
-    token_body = {"v":1,"sub":client_pub_hex,"scopes":scopes_list,"exp":int(exp_unix),
-                  "device": state.get("client_address") or f"device.{DEVICE_PUBHEX}", "rc": REV_COUNTER}
-    token = sign_token(token_body)
-    return {"token": token, "exp": token_body["exp"], "scopes": token_body["scopes"], "device": token_body["device"]}
+# Overlay state for QR invites (normalized polys; TTL-based)
+_qr_overlay_lock = threading.Lock()
+_qr_overlay_state = {"ts": 0.0, "polys_norm": []}  # list of [[xN,yN],...] with coords in [0..1]
+
+def _qr_set_overlay(polys_norm: List[List[Tuple[float,float]]]):
+    with _qr_overlay_lock:
+        _qr_overlay_state["ts"] = time.time()
+        _qr_overlay_state["polys_norm"] = polys_norm
+
+def _qr_get_overlay(ttl: float = 2.0) -> List[List[Tuple[float,float]]]:
+    with _qr_overlay_lock:
+        if time.time() - _qr_overlay_state["ts"] <= ttl:
+            return [list(map(tuple, poly)) for poly in _qr_overlay_state["polys_norm"]]
+        return []
+
+def _draw_polys_on_bgr(img: np.ndarray, polys_norm: List[List[Tuple[float,float]]], color=(0,255,0)):
+    if img is None or not polys_norm: return
+    h, w = img.shape[:2]
+    for poly in polys_norm:
+        if not poly: continue
+        pts = np.array([[int(x*w), int(y*h)] for (x,y) in poly], dtype=np.int32)
+        cv2.polylines(img, [pts], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+        p0 = pts[0]
+        cv2.putText(img, "INVITE", (p0[0]+4, p0[1]-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
 
 # ──────────────────────────────────────────────────────────────────────
-# 9) inbound handling (topic + DM), presence, serial, and /res logging
+# 9) Stream Registry (+ baseline protection + per-stream dedicated events)
+# ──────────────────────────────────────────────────────────────────────
+def _simple_event_for(stype: str, name: str) -> str:
+    n = (name or "").lower()
+    if stype == "camera" and (("depth" in n) or ("ir" in n)):
+        return "frame-depth"
+    return "frame-color"
+
+def _is_depthlike(stype: str, name: str) -> bool:
+    n = (name or "").lower()
+    return stype == "camera" and (("depth" in n) or ("ir" in n))
+
+class StreamSource:
+    def __init__(self, stype: str, name: str, url: str, hz: int):
+        self.stype = stype
+        self.name  = name
+        self.url   = url
+        self.hz    = max(1, min(60, hz))
+        self.period= 1.0 / self.hz
+        self.grabber, detected_type = make_grabber(url, CAMERA_HZ, STREAM_HZ)
+        self.topic = f"{TOPIC_PREFIX}.{self.stype}.{self.name}.{DEVICE_UUID}"
+        self.event_full = f"frame-{self.stype}-{self.name}".replace("__","_")
+        self.seq   = 0
+        self.running = False
+        self._t = None
+        self.subscribers: Set[str] = set()
+        self.kind = getattr(self.grabber, "kind", "unknown")
+        self.depthlike = _is_depthlike(self.stype, self.name)
+
+    def start(self):
+        if self.running: return
+        self.running = True
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+        _log(f"[stream] started {self.stype}/{self.name} ({self.kind}) -> topic {self.topic}")
+
+    def stop(self):
+        self.running = False
+        try:
+            if self._t and self._t.is_alive():
+                self._t.join(timeout=0.5)
+        except Exception:
+            pass
+        try: self.grabber.stop()
+        except Exception: pass
+        _log(f"[stream] stopped {self.stype}/{self.name}")
+
+    def _loop(self):
+        win_name = f"{self.stype}/{self.name}"
+        try: cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        except Exception: pass
+
+        baseline = (self.stype, self.name) in ALWAYS_ON_KEYS and (self.stype, self.name) == BASELINE_COLOR
+
+        # NEW: classify by NAME (not by image shape) so MJPEG "depth" or "ir" doesn’t get treated as RGB
+        name_lc = (self.name or "").lower()
+        treat_as_depth = ("depth" in name_lc) or ("ir" in name_lc)
+
+        while self.running:
+            t0 = time.time()
+            frame = self.grabber.read()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            polys = _qr_get_overlay() if baseline else []
+            show_preview = baseline or bool(self.subscribers)
+
+            if treat_as_depth:
+                # ---------- DEPTH/IR PATH (always encode PNG gray8) ----------
+                # Normalize to 8-bit gray regardless of source format
+                if frame.ndim == 3 and frame.shape[2] == 3:
+                    g8 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                elif frame.dtype == np.uint16:
+                    g8 = _u16_to_u8_auto(frame)
+                else:
+                    g8 = _to_gray8(frame)
+
+                if g8 is not None and show_preview:
+                    try:
+                        vis = cv2.cvtColor(g8, cv2.COLOR_GRAY2BGR)
+                        if polys:
+                            _draw_polys_on_bgr(vis, polys, color=(0,255,0))
+                        cv2.putText(vis, f"{self.name} {g8.shape[1]}x{g8.shape[0]} {self.hz}Hz",
+                                    (10,24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+                        cv2.imshow(win_name, vis); cv2.waitKey(1)
+                    except Exception:
+                        pass
+
+                if g8 is not None and self.subscribers:
+                    b64p, raw_bytes, w, h = _fit_b64_png_by_res(g8, MAX_B64)
+                    if b64p:
+                        self.seq += 1
+                        base = {"uuid": DEVICE_UUID, "data": b64p,
+                                "w": w, "h": h, "seq": self.seq, "ts": int(t0*1000),
+                                "topic": self.topic, "no_ack": 1}
+                        payload_full   = dict(base, event=self.event_full, kind="frame-depth")
+                        payload_compat = dict(base, event="frame-depth",  kind="frame-depth")
+
+                        groups: Dict[float, List[str]] = {}
+                        for addr in list(self.subscribers):
+                            sc = float(_ensure_peer(addr).get("scale", 1.0))
+                            groups.setdefault(sc, []).append(addr)
+
+                        for sc, addrs in groups.items():
+                            if abs(sc - 1.0) > 1e-3:
+                                sw = max(2, int(w * sc)); sh = max(2, int(h * sc))
+                                g8s = cv2.resize(g8, (sw, sh), interpolation=cv2.INTER_AREA)
+                                b64s, _, sw2, sh2 = _fit_b64_png_by_res(g8s, MAX_B64)
+                                if b64s:
+                                    base_s = dict(base, data=b64s, w=sw2, h=sh2)
+                                    p_full   = dict(base_s, event=self.event_full, kind="frame-depth")
+                                    p_compat = dict(base_s, event="frame-depth",  kind="frame-depth")
+                                    for addr in addrs:
+                                        _dm(addr, p_full,   tries=1, fire=True)
+                                        _dm(addr, p_compat, tries=1, fire=True)
+                            else:
+                                for addr in addrs:
+                                    _dm(addr, payload_full,   tries=1, fire=True)
+                                    _dm(addr, payload_compat, tries=1, fire=True)
+
+                        if ENABLE_TOPICS: _pub(self.topic, payload_full)
+
+            else:
+                # ---------- COLOR PATH (JPEG) ----------
+                out = frame if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                if polys:
+                    _draw_polys_on_bgr(out, polys, color=(0,255,0))
+
+                if show_preview:
+                    try:
+                        vis = out.copy()
+                        cv2.putText(vis, f"{self.name} {out.shape[1]}x{out.shape[0]} {self.hz}Hz",
+                                    (10,24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
+                        cv2.imshow(win_name, vis); cv2.waitKey(1)
+                    except Exception:
+                        pass
+
+                if self.subscribers:
+                    b64, raw_bytes, w, h = _fit_b64_jpeg_by_res(out, JPEG_QUALITY, MAX_B64)
+                    if b64:
+                        self.seq += 1
+                        base = {"uuid": DEVICE_UUID, "data": b64,
+                                "w": w, "h": h, "seq": self.seq, "ts": int(t0*1000),
+                                "topic": self.topic, "no_ack": 1}
+                        payload_full   = dict(base, event=self.event_full, kind="frame-color")
+                        payload_compat = dict(base, event="frame-color",  kind="frame-color")
+
+                        groups: Dict[float, List[str]] = {}
+                        for addr in list(self.subscribers):
+                            sc = float(_ensure_peer(addr).get("scale", 1.0))
+                            groups.setdefault(sc, []).append(addr)
+
+                        for sc, addrs in groups.items():
+                            if abs(sc - 1.0) > 1e-3:
+                                sw = max(2, int(w * sc)); sh = max(2, int(h * sc))
+                                color_scaled = cv2.resize(out, (sw, sh), interpolation=cv2.INTER_AREA)
+                                b64s, _, sw2, sh2 = _fit_b64_jpeg_by_res(color_scaled, JPEG_QUALITY, MAX_B64)
+                                if b64s:
+                                    base_s = dict(base, data=b64s, w=sw2, h=sh2)
+                                    p_full   = dict(base_s, event=self.event_full, kind="frame-color")
+                                    p_compat = dict(base_s, event="frame-color",  kind="frame-color")
+                                    for addr in addrs:
+                                        _dm(addr, p_full,   tries=1, fire=True)
+                                        _dm(addr, p_compat, tries=1, fire=True)
+                            else:
+                                for addr in addrs:
+                                    _dm(addr, payload_full,   tries=1, fire=True)
+                                    _dm(addr, payload_compat, tries=1, fire=True)
+
+                        if ENABLE_TOPICS: _pub(self.topic, payload_full)
+
+
+class StreamRegistry:
+    def __init__(self):
+        self.sources: Dict[Tuple[str,str], StreamSource] = {}
+        self.lock = threading.Lock()
+
+    def get_or_create(self, stype: str, name: str, url: str, hz: int) -> StreamSource:
+        key = (stype, name)
+        with self.lock:
+            s = self.sources.get(key)
+            if s is None:
+                s = StreamSource(stype, name, url, hz)
+                self.sources[key] = s
+        return s
+
+    def stop_if_idle(self, stype: str, name: str):
+        key = (stype, name)
+        with self.lock:
+            s = self.sources.get(key)
+            if s and not s.subscribers and key not in ALWAYS_ON_KEYS:
+                s.stop()
+                del self.sources[key]
+
+    def list_active(self) -> List[Dict[str,Any]]:
+        with self.lock:
+            return [{
+                "type": s.stype,
+                "name": s.name,
+                "url": s.url,
+                "hz": s.hz,
+                "topic": s.topic,
+                "event_full": s.event_full,                     # dedicated per-stream event
+                "compat_event": _simple_event_for(s.stype, s.name),  # generic (frame-color/depth)
+                "subs": len(s.subscribers),
+                "running": s.running,
+                "kind": s.kind
+            } for s in self.sources.values()]
+
+streams = StreamRegistry()
+ALWAYS_ON_KEYS: Set[Tuple[str,str]] = set()
+BASELINE_COLOR: Optional[Tuple[str,str]] = None  # (stype,name) for QR preview
+
+# ──────────────────────────────────────────────────────────────────────
+# 10) discovery helpers
+# ──────────────────────────────────────────────────────────────────────
+def norm_name(s: str) -> str: return s.strip()
+def build_url(base: str, stype: str, name: str) -> str: return f"{base.rstrip('/')}/{stype.strip('/')}/{name}"
+
+def probe_endpoint(url: str, *, quick=False) -> Tuple[bool, str]:
+    try:
+        if quick:
+            r = requests.head(url, timeout=2.0)
+            if r.status_code != 200: return False, "unknown"
+            ct = (r.headers.get("Content-Type","") or "").lower()
+            if "multipart" in ct: return True, "mjpeg"
+            if ct.startswith("image/"): return True, "single-image"
+            return True, "unknown"
+        r = requests.get(url, stream=True, timeout=3.0)
+        if r.status_code != 200: return False, "unknown"
+        ct = (r.headers.get("Content-Type","") or "").lower()
+        if "multipart" in ct: return True, "mjpeg"
+        if ct.startswith("image/"): return True, "single-image"
+        return True, "unknown"
+    except Exception:
+        return False, "unknown"
+
+def discover_streams() -> Dict[str, List[Dict[str,Any]]]:
+    found = {"camera": [], "video": []}
+    for stype in ("camera","video"):
+        base = CAMERA_BASE if stype=="camera" else VIDEO_BASE
+        for cand in STREAM_CANDIDATES:
+            name = cand.strip()
+            tried = set()
+            for nm in (name, name.replace("_","-") if "_" in name else name.replace("-","_")):
+                if nm in tried: continue
+                tried.add(nm)
+                url = build_url(base, stype, nm)
+                ok, kind = probe_endpoint(url, quick=True)
+                if ok:
+                    hz = CAMERA_HZ if stype=="camera" else STREAM_HZ
+                    found[stype].append({"type": stype, "name": nm, "url": url, "kind": kind, "hz": hz})
+                    break
+    return found
+
+# ──────────────────────────────────────────────────────────────────────
+# 11) presence + control + commands (+ QR scan baseline on camera/rs_color)
 # ──────────────────────────────────────────────────────────────────────
 def _ack(addr: str, ok: bool, note: str):
-    _dm(addr, {"event": "ack", "ok": bool(ok), "note": note})
+    _dm(addr, {"event": "ack", "ok": bool(ok), "note": note}, fire=False)
 
 def _mark_online(addr: str):
     st = _ensure_peer(addr)
     st["online"] = True
     st["last_online"] = time.time()
 
-def send_stats_now(addr: str, st: Dict[str, Any], *, last_bytes: int = 0, w: int = 0, h: int = 0):
-    now = time.time()
-    tick_dt = max(1e-6, now - st.get("last_tick_ts", now))
-    fps_out = st.get("sent_since_tick", 0) / tick_dt
-    msg = {"event":"stats","fps_out":round(fps_out,2),"jpeg_bytes":int(last_bytes),
-           "scale":round(st.get("scale",1.0),3),"w":int(w),"h":int(h),"ts":int(now*1000)}
-    _dm(addr, msg)
-    st["sent_since_tick"] = 0
-    st["last_tick_ts"] = now
-
-def _update_scale(addr: str, scale: float):
-    st = _ensure_peer(addr)
-    st["scale"] = float(max(0.1, min(1.0, scale)))
-    pct = int(round(st["scale"]*100))
-    print(f"[res] {addr} set to {pct}%")
-    if addr in addresses:
-        addresses[addr]["scale"] = float(st["scale"])
-        addresses[addr]["last_seen"] = int(time.time())
-        _save_addresses(addresses)
-    _ack(addr, True, f"resolution set to {pct}%")
+def _streams_summary() -> Dict[str, Any]:
+    """Top-level color/depth summary for UI convenience."""
+    color = None
+    depth = None
+    for s in list(streams.sources.values()):
+        if not s.running: continue
+        evt = _simple_event_for(s.stype, s.name)
+        if evt == "frame-color" and color is None:
+            color = {"type": s.stype, "name": s.name, "topic": s.topic}
+        if evt == "frame-depth" and depth is None:
+            depth = {"type": s.stype, "name": s.name, "topic": s.topic}
+    return {"color": color, "depth": depth}
 
 def send_stream_info(addr: str, *, force: bool = False):
     st = _ensure_peer(addr)
@@ -759,20 +1092,372 @@ def send_stream_info(addr: str, *, force: bool = False):
     info = {
         "event": "streams",
         "uuid": DEVICE_UUID,
-        "color": { "mode": "dm" + ("+topic" if ENABLE_TOPICS else ""), "event": "frame-color", "format": "jpeg", "hz": COLOR_HZ, "quality": JPEG_QUALITY, "topic": COLOR_TOPIC },
-        "rgb_url": COLOR_URL or "",
+        "label": DEVICE_LABEL,
+        "active": streams.list_active(),
+        "topic_cmd": state.get("cmd_topic"),
+        "bases": {"camera": CAMERA_BASE, "video": VIDEO_BASE},
+        "candidates": STREAM_CANDIDATES,
+        "always_on": list(ALWAYS_ON_KEYS),
+        **_streams_summary(),
     }
-    if HAS_DEPTH:
-        info["depth"] = { "mode": "dm" + ("+topic" if ENABLE_TOPICS else ""), "event": "frame-depth", "format": "png", "hz": DEPTH_HZ, "scale": DEPTH_SCALE, "topic": DEPTH_TOPIC }
-        info["depth_url"] = DEPTH_URL
-    _dm(addr, info)
+    _dm(addr, info, fire=False)
     st["last_info_ts"] = now
-    print(f"[streams] announced to {addr} (color Hz={COLOR_HZ}, depth Hz={DEPTH_HZ if HAS_DEPTH else 0})")
+
+def parse_get_command(cmd: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Supports:
+      get streams
+      get <name>                -> defaults to video
+      get <type> <name>        -> explicit type camera|video
+      stop <name>              -> defaults to video
+      stop <type> <name>       -> explicit type
+    """
+    raw = cmd.strip()
+    parts = raw.split()
+    if len(parts) >= 2 and parts[0].lower() == "get" and parts[1].lower() == "streams":
+        return "list", None, None
+    if parts and parts[0].lower() == "get":
+        if len(parts) == 2:
+            return "start", "video", norm_name(parts[1])
+        if len(parts) >= 3:
+            return "start", parts[1].lower(), norm_name(parts[2])
+    if parts and parts[0].lower() == "stop":
+        if len(parts) == 2:
+            return "stop", "video", norm_name(parts[1])
+        if len(parts) >= 3:
+            return "stop", parts[1].lower(), norm_name(parts[2])
+    return "", None, None
+
+def _try_find_stream(stype: str, name: str) -> Tuple[bool, str, str, str]:
+    """Try (stype,name) and underscore/dash variant; return (ok, stype, name, url)."""
+    def _alt(n: str) -> str:
+        return n.replace("_","-") if "_" in n else n.replace("-","_")
+    bases = {"camera": CAMERA_BASE, "video": VIDEO_BASE}
+    order = [stype]
+    other = "camera" if stype == "video" else "video"
+    if other not in order: order.append(other)
+    tried = []
+    for st in order:
+        base = bases[st]
+        for nm in [name, _alt(name)]:
+            url = build_url(base, st, nm)
+            tried.append(f"{st}:{url}")
+            ok, _kind = probe_endpoint(url, quick=True)
+            if ok:
+                return True, st, nm, url
+    _log(f"[probe] not found ({', '.join(tried)})")
+    return False, stype, name, build_url(bases[stype], stype, name)
+
+# ——— Baseline /camera/rs_color for QR + preview
+def _find_url_with_alt(base: str, stype: str, name: str) -> Tuple[Optional[str], Optional[str]]:
+    tried = []
+    url = build_url(base, stype, name); tried.append(url)
+    ok, _ = probe_endpoint(url, quick=True)
+    if ok: return url, name
+    alt = name.replace("_","-") if "_" in name else name.replace("-","_")
+    if alt != name:
+        url2 = build_url(base, stype, alt); tried.append(url2)
+        ok2, _ = probe_endpoint(url2, quick=True)
+        if ok2: return url2, alt
+    _log(f"[probe] {stype}/{name} not found (tried: {', '.join(tried)})")
+    return None, None
+
+def ensure_baseline_streams():
+    """Ensure camera/rs_color is always-on for QR; also honor ANY additional ALWAYS_ON items."""
+    need: List[Tuple[str,str,str,int]] = []
+
+    # 1) Mandatory QR baseline: camera/rs_color
+    url_qr, nm_qr = _find_url_with_alt(CAMERA_BASE, "camera", "rs_color")
+    if url_qr:
+        need.append(("camera", nm_qr, url_qr, CAMERA_HZ))
+    else:
+        need.append(("camera", "rs_color", build_url(CAMERA_BASE, "camera", "rs_color"), CAMERA_HZ))
+
+    # 2) Additional ALWAYS_ON
+    for item in ALWAYS_ON_CONF:
+        if ":" not in item: continue
+        stype, name = item.split(":",1)
+        stype = stype.strip().lower(); name = norm_name(name)
+        if stype == "camera" and name in ("rs_color","auto"):
+            continue
+        base = CAMERA_BASE if stype=="camera" else VIDEO_BASE
+        url, newname = _find_url_with_alt(base, stype, name)
+        if url:
+            hz = CAMERA_HZ if stype=="camera" else STREAM_HZ
+            need.append((stype, newname or name, url, hz))
+
+    for stype,name,url,hz in need:
+        key = (stype,name)
+        if key in ALWAYS_ON_KEYS:
+            continue
+        s = streams.get_or_create(stype, name, url, hz)
+        ALWAYS_ON_KEYS.add(key)
+        if stype == "camera" and ("color" in name.lower() or name.lower()=="rs_color"):
+            global BASELINE_COLOR
+            BASELINE_COLOR = key
+        if not s.running: s.start()
+        _log(f"[baseline] {stype}/{name} running @ {url} (hz={hz})")
+
+# ——— QR scanner on baseline camera/rs_color (overlay + grant)
+class QRScanner:
+    def __init__(self, read_fn, max_width: int = 960):
+        self.read_fn = read_fn
+        self.max_width = max_width
+        self.stop_evt = threading.Event()
+        self.det = cv2.QRCodeDetector()
+        self.seen: Dict[str, float] = {}  # dedup_key -> ts
+
+    def start(self):
+        if self.max_width <= 0:
+            _log("[qr] disabled (SCAN_MAX_WIDTH=0)")
+            return
+        threading.Thread(target=self._loop, daemon=True).start()
+        _log(f"[qr] scanner started (max_width={self.max_width})")
+
+    def _normalize_polys(self, polys: List[np.ndarray], w: int, h: int) -> List[List[Tuple[float,float]]]:
+        out: List[List[Tuple[float,float]]] = []
+        for p in polys:
+            try:
+                pts = p.reshape(-1,2)
+                norm = [(float(x)/float(w), float(y)/float(h)) for (x,y) in pts]
+                out.append(norm)
+            except Exception:
+                continue
+        return out
+
+    def _emit_overlay_event(self, polys_norm: List[List[Tuple[float,float]]]):
+        if not polys_norm: return
+        payload = {"event":"qr-overlay","polys":polys_norm, "ts": int(time.time()*1000), "no_ack": 1}
+        for addr in list(addresses.keys()):
+            _dm(addr, payload, tries=1, fire=True)
+
+    def _looks_pubkey_text(self, t: str) -> Tuple[bool, Optional[str]]:
+        """Return (True, pubhex) if t is a recognizable pubkey-only string."""
+        s = (t or "").strip()
+        # base64url of 32 bytes (Ed25519 pubkey) → ~43 chars (no padding)
+        try:
+            b = b64url_decode(s)
+            if len(b) == 32:
+                return True, b.hex()
+        except Exception:
+            pass
+        # raw 64-hex
+        if re.fullmatch(r"[0-9a-fA-F]{64}", s):
+            return True, s.lower()
+        # identifier.pubhex
+        m = re.fullmatch(r"[A-Za-z0-9_-]+\.([0-9a-fA-F]{64})", s)
+        if m:
+            return True, m.group(1).lower()
+        return False, None
+
+    def _dedup_key_for_text(self, t: str) -> str:
+        if t.startswith("nkn+invite:"):
+            return t
+        ok, hx = self._looks_pubkey_text(t)
+        if ok and hx:
+            return "pk:"+hx
+        return "other:"+t  # conservative
+
+    def _loop(self):
+        while not self.stop_evt.is_set():
+            frame = self.read_fn()
+            if frame is None:
+                time.sleep(0.05); continue
+            try:
+                img = frame
+                h, w = img.shape[:2]
+                if self.max_width and w > self.max_width:
+                    scale = self.max_width / float(w)
+                    img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+                    h, w = img.shape[:2]
+
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+                texts: List[str] = []
+                polys: List[np.ndarray] = []
+
+                try:
+                    retval, decoded_info, pts, _ = self.det.detectAndDecodeMulti(gray)
+                    if pts is not None and len(pts):
+                        for poly in pts:
+                            polys.append(np.asarray(poly, dtype=np.float32))
+                    if retval and decoded_info:
+                        texts.extend([s for s in decoded_info if s])
+                except Exception:
+                    pass
+
+                if not texts:
+                    try:
+                        t, pts, _ = self.det.detectAndDecode(gray)
+                        if t:
+                            texts.append(t)
+                        if pts is not None and len(pts):
+                            polys.append(np.asarray(pts, dtype=np.float32))
+                    except Exception:
+                        pass
+
+                invites = []
+                overlay_polys: List[np.ndarray] = []
+                now = time.time()
+
+                for t, p in zip(texts, polys):
+                    if not isinstance(t, str): continue
+                    is_old = t.startswith("nkn+invite:")
+                    is_short, _hx = self._looks_pubkey_text(t)
+                    if not (is_old or is_short):
+                        continue
+                    dedup_key = self._dedup_key_for_text(t)
+                    if dedup_key in self.seen and now - self.seen[dedup_key] < 10:
+                        overlay_polys.append(p)
+                        continue
+                    self.seen[dedup_key] = now
+                    invites.append((t, p, dedup_key))
+
+                all_polys = overlay_polys + [p for (_t,p,_k) in invites]
+                if all_polys:
+                    polys_norm = self._normalize_polys(all_polys, w, h)
+                    _qr_set_overlay(polys_norm)
+                    self._emit_overlay_event(polys_norm)
+
+                for txt, _p, _k in invites:
+                    ok, note, dest, scopes, exp = process_any_invite(txt)
+                    _log(f"[qr] parsed: ok={ok} note={note}")
+            except Exception:
+                pass
+            time.sleep(0.06)
+
+    def stop(self): self.stop_evt.set()
+
+qr_scanner: Optional[QRScanner] = None
+
+def _maybe_start_qr_scanner():
+    global qr_scanner
+    if BASELINE_COLOR and tuple(BASELINE_COLOR) in streams.sources:
+        s = streams.sources[tuple(BASELINE_COLOR)]
+        qr_scanner = QRScanner(read_fn=s.grabber.read, max_width=SCAN_MAX_WIDTH)
+        qr_scanner.start()
+
+def handle_inbound(src_addr: str, payload: Any, *, topic: Optional[str] = None):
+    if not src_addr: return
+    _mark_online(src_addr)
+
+    body = payload if isinstance(payload, dict) else {}
+    cmd = ""
+    if isinstance(payload, str):
+        cmd = payload.strip()
+    elif isinstance(payload, dict):
+        cmd = (payload.get("cmd") or payload.get("data") or payload.get("raw") or "").strip()
+
+    if cmd: _log(f"[cmd] from {src_addr} topic={topic or '-'} → {cmd}")
+
+    if isinstance(body, dict) and body.get("event") == "ping":
+        _dm(src_addr, {"event":"hello","from": state.get("client_address"), "uuid": DEVICE_UUID}, fire=False)
+        send_stream_info(src_addr); return
+    if isinstance(body, dict) and body.get("event") == "hello":
+        _dm(src_addr, {"event":"hello-ack","uuid": DEVICE_UUID}, fire=False)
+        send_stream_info(src_addr); return
+
+    if topic and topic != state.get("cmd_topic"): return
+
+    action, stype, name = parse_get_command(cmd) if cmd else ("",None,None)
+
+    if action == "list":
+        _log(f"[streams] list requested by {src_addr}")
+        available = discover_streams()
+        reply = {"event":"streams-list","available": available,"active": streams.list_active()}
+        _dm(src_addr, reply, fire=False)
+        return
+
+    elif action == "start" and stype and name:
+        ok, stype_found, name_found, url = _try_find_stream(stype, name)
+        if not ok:
+            _ack(src_addr, False, f"{stype}/{name} not found (auto-fallback tried camera/video)")
+            return
+
+        hz = CAMERA_HZ if stype_found=="camera" else STREAM_HZ
+        s = streams.get_or_create(stype_found, name_found, url, hz)
+        s.subscribers.add(src_addr)
+        if not s.running: s.start()
+        _dm(src_addr, {"event":"subscribed","type":stype_found,"name":name_found,"topic":s.topic,"url":url,"hz":hz,"event_name":s.event_full}, fire=False)
+        send_stream_info(src_addr, force=True)
+        _log(f"[streams] subscribed {src_addr} to {stype_found}/{name_found} @ {url} (hz={hz})")
+        return
+
+    elif action == "stop" and stype and name:
+        # Also honor auto-found stype/name pair if user used a mismatched type earlier
+        for key in list(streams.sources.keys()):
+            if key[1] == name and (key[0] == stype or True):
+                s = streams.sources.get(key)
+                if s and src_addr in s.subscribers:
+                    s.subscribers.discard(src_addr)
+                    _dm(src_addr, {"event":"unsubscribed","type":key[0],"name":key[1]}, fire=False)
+                    if not s.subscribers:
+                        streams.stop_if_idle(key[0], key[1])
+                    send_stream_info(src_addr, force=True)
+                    _log(f"[streams] unsubscribed {src_addr} from {key[0]}/{key[1]}")
+                    return
+        _ack(src_addr, False, f"not subscribed to {stype}/{name}")
+        return
+
+    if cmd.lower().startswith("/res"):
+        parts = cmd.split()
+        if len(parts) >= 2:
+            p = parts[1].rstrip("%")
+            try:
+                pct = float(p)
+                st = _ensure_peer(src_addr)
+                st["scale"] = float(max(0.1, min(1.0, pct/100.0)))
+                pcti = int(round(st["scale"]*100))
+                _ack(src_addr, True, f"resolution set to {pcti}%")
+                _log(f"[res] {src_addr} → {pcti}%"); return
+            except Exception: pass
+        _ack(src_addr, False, "usage: /res <percent>"); return
+
+    if cmd.lower().startswith("/stats"):
+        st = _ensure_peer(src_addr)
+        toks = cmd.split()
+        if len(toks) == 1:
+            _ack(src_addr, True, f"stats={'on' if st.get('stats_on') else 'off'} hz={st.get('stats_hz',1)}"); return
+        arg = toks[1].lower()
+        if arg in ("on","off"):
+            st["stats_on"] = (arg == "on"); _ack(src_addr, True, f"stats {arg}")
+            _log(f"[stats] {src_addr} → {arg}"); return
+        if arg == "hz" and len(toks) >= 3:
+            try:
+                hz = max(1, min(10, int(toks[2]))); st["stats_hz"] = hz; _ack(src_addr, True, f"stats hz={hz}")
+                _log(f"[stats] {src_addr} → hz {hz}")
+            except Exception:
+                _ack(src_addr, False, "usage: /stats hz <n>")
+            return
+        if arg == "once":
+            _ack(src_addr, True, "stats once (not implemented)"); return
+        _ack(src_addr, False, "usage: /stats on|off | /stats hz <n> | /stats once"); return
+
+    if cmd.lower() in ("/home","home","/center","center"):
+        ok = _serial_send("HOME"); _ack(src_addr, ok, "HOME sent" if ok else "no serial")
+        _log(f"[serial] HOME by {src_addr} ok={ok}"); return
+
+    if cmd and _validate_axes_cmd(cmd):
+        full = _merge_axes_cmd(cmd); ok = _serial_send(full)
+        _ack(src_addr, ok, f"serial: {full}" if ok else "no serial")
+        _log(f"[serial] {src_addr} → {full} ok={ok}"); return
+
+    if cmd:
+        _ack(src_addr, False, "unknown command")
+        _log(f"[cmd] unknown from {src_addr}: {cmd}")
+
+# ──────────────────────────────────────────────────────────────────────
+# 12) QR grant flow (legacy + short pubkey-only)
+# ──────────────────────────────────────────────────────────────────────
+def grant_for(client_pub_hex: str, scopes_list: List[str], exp_unix: int) -> dict:
+    token_body = {"v":1,"sub":client_pub_hex,"scopes":scopes_list,"exp":int(exp_unix),
+                  "device": state.get("client_address") or f"device.{DEVICE_PUBHEX}", "rc": REV_COUNTER}
+    token = sign_token(token_body)
+    return {"token": token, "exp": token_body["exp"], "scopes": token_body["scopes"], "device": token_body["device"]}
 
 def verify_invite_sig_v1(client_addr: str, v: str, scopes: str, exp: str, nonce_b64url: str, sig_b64url: str) -> Tuple[bool, Optional[str]]:
     s = (client_addr or "").strip()
-    if re.fullmatch(r"[0-9a-fA-F]{64}", s):
-        pubhex = s.lower()
+    if re.fullmatch(r"[0-9a-fA-F]{64}", s): pubhex = s.lower()
     else:
         m = re.fullmatch(r"[A-Za-z0-9_-]+\.([0-9a-fA-F]{64})", s)
         pubhex = m.group(1).lower() if m else None
@@ -808,6 +1493,7 @@ def scopes_from_short(s_short: str) -> List[str]:
     return out
 
 def process_qr_payload(txt: str) -> Tuple[bool, str, Optional[str], List[str], int]:
+    """Legacy nkn+invite parser (v1/v2)."""
     try:
         if not txt.startswith("nkn+invite:"):
             return False, "QR not an NKN invite", None, [], 0
@@ -816,7 +1502,6 @@ def process_qr_payload(txt: str) -> Tuple[bool, str, Optional[str], List[str], i
         get = lambda k: (params.get(k,[""])[0] or "").strip()
         v = get("v") or "1"
 
-        # v2 compact
         if v == "2" or get("a"):
             a  = get("a"); s = get("s"); e = get("e"); n = get("n"); g = get("g")
             ident = get("i") or "client"
@@ -832,13 +1517,12 @@ def process_qr_payload(txt: str) -> Tuple[bool, str, Optional[str], List[str], i
             scopes_list = scopes_from_short(s)
             dest_addr = f"{ident}.{client_pub_hex}"
             grant = grant_for(client_pub_hex, scopes_list, exp_unix)
-            _dm(dest_addr, {"v":2,"type":"grant","grant":grant}, tries=2)
+            _dm(dest_addr, {"v":2,"type":"grant","grant":grant}, fire=False)
             _persist_peer(dest_addr, ident, grant["scopes"], grant["exp"], grant["device"], scale=1.0)
-            _dm(dest_addr, {"event":"hello","from": state.get("client_address"), "uuid": DEVICE_UUID})
+            _dm(dest_addr, {"event":"hello","from": state.get("client_address"), "uuid": DEVICE_UUID}, fire=False)
             send_stream_info(dest_addr, force=True)
             return True, f"GRANTED (v2) to {dest_addr}", dest_addr, scopes_list, exp_unix
 
-        # v1 legacy
         caddr  = get("clientAddr")
         label  = urllib.parse.unquote(get("label"))
         scopes_csv = get("scopes") or ""
@@ -856,310 +1540,110 @@ def process_qr_payload(txt: str) -> Tuple[bool, str, Optional[str], List[str], i
         dest_addr = caddr.strip() if re.fullmatch(r"[A-Za-z0-9_-]+\.([0-9a-fA-F]{64})", (caddr or "").strip()) else f"{ident}.{client_pub_hex}"
         exp_unix = int(exp)
         grant = grant_for(client_pub_hex, scopes_list, exp_unix)
-        _dm(dest_addr, {"v":1,"type":"grant","grant":grant}, tries=2)
+        _dm(dest_addr, {"v":1,"type":"grant","grant":grant}, fire=False)
         _persist_peer(dest_addr, label or ident, grant["scopes"], grant["exp"], grant["device"], scale=1.0)
-        _dm(dest_addr, {"event":"hello","from": state.get("client_address"), "uuid": DEVICE_UUID})
+        _dm(dest_addr, {"event":"hello","from": state.get("client_address"), "uuid": DEVICE_UUID}, fire=False)
         send_stream_info(dest_addr, force=True)
         return True, f"GRANTED (v1) to {dest_addr}", dest_addr, scopes_list, exp_unix
 
     except Exception as e:
         return False, f"QR error: {e}", None, [], 0
 
-def handle_inbound(src_addr: str, payload: Any, *, topic: Optional[str] = None):
-    if not src_addr: return
-    _mark_online(src_addr)
+def process_any_invite(txt: str) -> Tuple[bool, str, Optional[str], List[str], int]:
+    """Accepts legacy nkn+invite:* AND short pubkey-only codes (base64url/hex/identifier.hex)."""
+    try:
+        if isinstance(txt, str) and txt.startswith("nkn+invite:"):
+            return process_qr_payload(txt)
 
-    cmd = ""
-    body = payload if isinstance(payload, dict) else {}
-    if isinstance(payload, str):
-        cmd = payload.strip()
-    elif isinstance(payload, dict):
-        cmd = (payload.get("cmd") or payload.get("data") or payload.get("raw") or "").strip()
+        s = (txt or "").strip()
+        pubhex = None
+        # base64url (32 bytes)
+        try:
+            b = b64url_decode(s)
+            if len(b) == 32:
+                pubhex = b.hex()
+        except Exception:
+            pass
+        # 64-hex
+        if pubhex is None and re.fullmatch(r"[0-9a-fA-F]{64}", s):
+            pubhex = s.lower()
+        # identifier.pubhex
+        if pubhex is None:
+            m = re.fullmatch(r"[A-Za-z0-9_-]+\.([0-9a-fA-F]{64})", s)
+            if m: pubhex = m.group(1).lower()
 
-    # Presence
-    if isinstance(body, dict) and body.get("event") == "ping":
-        _dm(src_addr, {"event":"hello","from": state.get("client_address"), "uuid": DEVICE_UUID})
-        send_stream_info(src_addr); return
-    if isinstance(body, dict) and body.get("event") == "hello":
-        _dm(src_addr, {"event":"hello-ack","uuid": DEVICE_UUID})
-        send_stream_info(src_addr); return
+        if not pubhex:
+            return False, "Not an invite/pubkey", None, [], 0
 
-    # Orientation "Center" → HOME
-    if isinstance(body, dict) and str(body.get("event","")).lower() in ("orient","orientation","orientation-press"):
-        key = str(body.get("key") or body.get("btn") or body.get("button") or "").lower()
-        if key in ("center","centre","middle","reset","home"):
-            ok = _serial_send("HOME"); _ack(src_addr, ok, "center->HOME" if ok else "no serial"); return
+        default_sc = os.environ.get("DEFAULT_SCOPES_SHORT", "rd")
+        default_min = int(os.environ.get("DEFAULT_INV_MIN", "60"))
+        scopes_list = scopes_from_short(default_sc)
+        exp_unix = int(time.time()) + default_min*60
 
-    # Topic filter: only our cmd topic
-    if topic and topic != state.get("cmd_topic"):
-        return
-
-    # /res
-    if cmd.lower().startswith("/res"):
-        parts = cmd.split()
-        if len(parts) >= 2:
-            p = parts[1].rstrip("%")
-            try:
-                pct = float(p); _update_scale(src_addr, pct/100.0); return
-            except Exception:
-                pass
-        _ack(src_addr, False, "usage: /res <percent>"); return
-
-    # /stats
-    if cmd.lower().startswith("/stats"):
-        st = _ensure_peer(src_addr)
-        toks = cmd.split()
-        if len(toks) == 1:
-            _ack(src_addr, True, f"stats={'on' if st['stats_on'] else 'off'} hz={st['stats_hz']}"); return
-        arg = toks[1].lower()
-        if arg in ("on","off"):
-            st["stats_on"] = (arg == "on"); _ack(src_addr, True, f"stats {arg}"); return
-        if arg == "hz" and len(toks) >= 3:
-            try:
-                hz = max(1, min(10, int(toks[2]))); st["stats_hz"] = hz; _ack(src_addr, True, f"stats hz={hz}")
-            except Exception:
-                _ack(src_addr, False, "usage: /stats hz <1..10>")
-            return
-        if arg == "once": send_stats_now(src_addr, st); return
-        _ack(src_addr, False, "usage: /stats on|off | /stats hz <n> | /stats once"); return
-
-    if cmd.lower() in ("/ping",):
-        _dm(src_addr, {"event":"hello","from": state.get("client_address"), "uuid": DEVICE_UUID}); _ack(src_addr, True, "pong"); send_stream_info(src_addr); return
-
-    if cmd.lower() in ("/home","home"):
-        ok = _serial_send("HOME"); _ack(src_addr, ok, "HOME sent" if ok else "no serial"); return
-
-    if cmd.lower() in ("/center","center"):
-        ok = _serial_send("HOME"); _ack(src_addr, ok, "HOME sent" if ok else "no serial"); return
-
-    if cmd and _validate_axes_cmd(cmd):
-        full = _merge_axes_cmd(cmd); ok = _serial_send(full); _ack(src_addr, ok, f"serial: {full}" if ok else "no serial"); return
-
-    if cmd: _ack(src_addr, False, "unknown command")
+        dest_addr = f"client.{pubhex}"
+        grant = grant_for(pubhex, scopes_list, exp_unix)
+        _dm(dest_addr, {"type":"grant","grant":grant}, fire=False)
+        _persist_peer(dest_addr, "client", grant["scopes"], grant["exp"], grant["device"], scale=1.0)
+        _dm(dest_addr, {"event":"hello","from": state.get("client_address"), "uuid": DEVICE_UUID}, fire=False)
+        send_stream_info(dest_addr, force=True)
+        return True, f"GRANTED (pk) to {dest_addr}", dest_addr, scopes_list, exp_unix
+    except Exception as e:
+        return False, f"QR error: {e}", None, [], 0
 
 # ──────────────────────────────────────────────────────────────────────
-# 10) main: QR + stream both channels with symmetric pacing + live depth window
+# 13) main
 # ──────────────────────────────────────────────────────────────────────
 def run():
-    global HAS_DEPTH
     # wait NKN ready
     t0 = time.time()
     while not state.get("client_address"):
-        if time.time() - t0 > 20:
-            print("NKN not ready, exiting."); _shutdown()
+        if time.time() - t0 > 30:
+            _log("NKN not ready, exiting."); _shutdown()
         time.sleep(0.02)
 
     # restore peers
     if addresses:
         for addr, meta in addresses.items():
             _ensure_peer(addr, default_scale=float(meta.get("scale",1.0)))
-        print(f"[peers] restored {len(addresses)} from addresses.json")
+        _log(f"[peers] restored {len(addresses)} from addresses.json")
 
-    # Capture
-    print(f"[video] opening: {COLOR_URL}")
-    color_grabber = AutoGrabber(COLOR_URL)
-    print(f"[video] Using {color_grabber.kind.upper()} stream")
+    _log(f"[bases] camera={CAMERA_BASE}  video={VIDEO_BASE}")
+    _log(f"[candidates] {', '.join(STREAM_CANDIDATES) or '-'}")
 
-    depth_grabber = None
-    HAS_DEPTH = False
-    if DEPTH_URL:
-        print(f"[depth] opening: {DEPTH_URL}")
-        try:
-            depth_grabber = AutoGrabber(DEPTH_URL)
-            HAS_DEPTH = True
-            print(f"[depth] Using {depth_grabber.kind.upper()} stream")
-            for addr in list(addresses.keys()):
-                send_stream_info(addr, force=True)
-        except Exception as e:
-            print("[depth] failed to open depth stream:", e)
-            depth_grabber = None
-            HAS_DEPTH = False
-
-    # QR from color feed
-    detector = cv2.QRCodeDetector()
-    win_color = "Color / QR"
-    win_depth = "Depth Preview"
+    # HighGUI helper for multiple windows
     try:
-        cv2.namedWindow(win_color, cv2.WINDOW_NORMAL)
-        if HAS_DEPTH: cv2.namedWindow(win_depth, cv2.WINDOW_NORMAL)
+        cv2.startWindowThread()
     except Exception:
         pass
 
-    frames = 0
-    last_ts = time.perf_counter()
-    fps = 0.0
+    # Ensure baseline QR stream and any extra always-on
+    ensure_baseline_streams()
+    # Start QR scanner on baseline camera color (if available)
+    _maybe_start_qr_scanner()
 
-    d_frames = 0
-    d_last_ts = time.perf_counter()
-    d_fps = 0.0
-
-    color_period = 1.0 / float(COLOR_HZ)
-    depth_period = 1.0 / float(DEPTH_HZ if HAS_DEPTH else 1)
-    PER_PEER_MIN_INTERVAL_COLOR = max(0.5 * color_period, 1.0/60.0)
-    PER_PEER_MIN_INTERVAL_DEPTH = max(0.5 * depth_period, 1.0/60.0)
-    last_color_batch = 0.0
-    last_depth_batch = 0.0
-    seq_color = 0
-    seq_depth = 0
-    seen_invites = set()
+    _log("→ Ready. Commands: 'get streams', 'get rs_color', 'get camera rs_color', 'get rs_depth', 'get camera ir_left', 'stop rs_depth', '/res 50' etc.")
 
     try:
         while True:
-            frame = color_grabber.read()
-            if frame is None:
-                time.sleep(0.005)
-
-            # ---- QR + color preview window ----
-            if frame is not None:
-                work, scale = resize_keep_aspect(frame, SCAN_MAX_WIDTH) if SCAN_MAX_WIDTH > 0 else (frame, 1.0)
-                gray_for_qr = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-
-                decoded_strings: List[str] = []
-                polys_full: List[np.ndarray] = []
-
-                try:
-                    retval, decoded_info, pts, _ = detector.detectAndDecodeMulti(gray_for_qr)
-                    if pts is not None and len(pts):
-                        for poly in pts:
-                            p = (np.asarray(poly).reshape(-1, 2) * scale).astype(np.float32)
-                            polys_full.append(p)
-                    if retval and decoded_info:
-                        decoded_strings.extend([s for s in decoded_info if s])
-                except Exception:
-                    pass
-
-                if not decoded_strings:
-                    try:
-                        txt, pts, _ = detector.detectAndDecode(gray_for_qr)
-                        if pts is not None and len(pts):
-                            p = (np.asarray(pts).reshape(-1, 2) * scale).astype(np.float32)
-                            polys_full.append(p)
-                        if txt:
-                            decoded_strings.append(txt)
-                    except Exception:
-                        pass
-
-                for s in decoded_strings:
-                    if s in seen_invites: continue
-                    ok, msg, dest_addr, scopes, exp = process_qr_payload(s)
-                    if ok and dest_addr: print(msg)
-                    seen_invites.add(s)
-
-                try:
-                    vis = frame.copy()
-                    draw_polys(vis, polys_full, color=(0, 255, 0))
-                    frames += 1
-                    nowp = time.perf_counter()
-                    if nowp - last_ts >= 1.0:
-                        fps = frames / (nowp - last_ts); frames = 0; last_ts = nowp
-                    cv2.putText(vis, f"{fps:.1f} fps", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
-                    cv2.putText(vis, f"{DEVICE_LABEL}  uuid={DEVICE_UUID}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
-                    cv2.imshow(win_color, vis)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == 27 or key == ord('q'):
-                        break
-                except Exception:
-                    pass
-
-            # ---- Presence expiry ----
-            if peers:
-                tnow = time.time()
-                for addr, st in peers.items():
-                    if st["online"] and (tnow - st["last_online"] > PRESENCE_TTL):
-                        st["online"] = False
-
-                # ---- COLOR send ----
-                if frame is not None and (tnow - last_color_batch >= color_period):
-                    last_color_batch = tnow
-                    color_base = frame
-                    scale_groups: Dict[float, List[str]] = {}
-                    for addr, st in peers.items():
-                        if not st["online"]: continue
-                        if tnow - st.get("last_color_ts", 0.0) < PER_PEER_MIN_INTERVAL_COLOR:
-                            continue
-                        sc = float(st.get("scale", 1.0))
-                        scale_groups.setdefault(sc, []).append(addr)
-
-                    for sc, addrs in scale_groups.items():
-                        if abs(sc - 1.0) > 1e-3:
-                            w = max(2, int(color_base.shape[1] * sc))
-                            h = max(2, int(color_base.shape[0] * sc))
-                            color_scaled = cv2.resize(color_base, (w, h), interpolation=cv2.INTER_AREA)
-                        else:
-                            color_scaled = color_base
-                        b64, raw_bytes, w, h = _fit_b64_jpeg_by_res(color_scaled, JPEG_QUALITY, MAX_B64)
-                        if not b64: continue
-                        seq_color += 1
-                        payload = {"event":"frame-color","uuid":DEVICE_UUID,"data":b64,"w":w,"h":h,"seq":seq_color,"ts":int(tnow*1000)}
-                        for addr in addrs:
-                            _dm(addr, payload, tries=1)
-                            st = _ensure_peer(addr)
-                            st["last_color_ts"] = tnow
-                            st["sent_since_tick"] = st.get("sent_since_tick", 0) + 1
-                            if st.get("stats_on", False):
-                                per = 1.0 / max(1, int(st.get("stats_hz", 1)))
-                                if tnow - st.get("last_stats_ts", 0.0) >= per:
-                                    send_stats_now(addr, st, last_bytes=raw_bytes, w=w, h=h)
-                                    st["last_stats_ts"] = tnow
-                        _pub(COLOR_TOPIC, payload)
-
-                # ---- DEPTH send + depth preview window ----
-                if HAS_DEPTH and depth_grabber and (tnow - last_depth_batch >= depth_period):
-                    last_depth_batch = tnow
-                    dframe = depth_grabber.read()
-                    if dframe is not None:
-                        if dframe.ndim == 2 and dframe.dtype == np.uint16:
-                            g8 = _u16_to_u8_auto(dframe)
-                        else:
-                            g8 = _to_gray8(dframe)
-                        if g8 is not None:
-                            if DEPTH_SCALE and abs(DEPTH_SCALE - 1.0) > 1e-3:
-                                w = max(2, int(g8.shape[1] * DEPTH_SCALE))
-                                h = max(2, int(g8.shape[0] * DEPTH_SCALE))
-                                g8s = cv2.resize(g8, (w, h), interpolation=cv2.INTER_AREA)
-                            else:
-                                g8s = g8
-                                w, h = g8s.shape[1], g8s.shape[0]
-
-                            # show live depth (grayscale)
-                            try:
-                                visd = cv2.cvtColor(g8s, cv2.COLOR_GRAY2BGR)
-                                d_frames += 1
-                                nowd = time.perf_counter()
-                                if nowd - d_last_ts >= 1.0:
-                                    d_fps = d_frames / (nowd - d_last_ts); d_frames = 0; d_last_ts = nowd
-                                cv2.putText(visd, f"{d_fps:.1f} fps  {w}x{h}", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2, cv2.LINE_AA)
-                                cv2.imshow(win_depth, visd)
-                                # no extra waitKey; the earlier call services events
-                            except Exception:
-                                pass
-
-                            b64p, raw_bytes, w, h = _fit_b64_png_by_res(g8s, MAX_B64)
-                            if b64p:
-                                seq_depth += 1
-                                payload_d = {"event":"frame-depth","uuid":DEVICE_UUID,"data":b64p,"w":w,"h":h,"seq":seq_depth,"ts":int(tnow*1000)}
-                                for addr, st in peers.items():
-                                    if not st["online"]: continue
-                                    if tnow - st.get("last_depth_ts", 0.0) < PER_PEER_MIN_INTERVAL_DEPTH:
-                                        continue
-                                    _dm(addr, payload_d, tries=1)
-                                    st["last_depth_ts"] = tnow
-                                _pub(DEPTH_TOPIC, payload_d)
-
+            time.sleep(0.5)
+            # mark offline by TTL
+            now = time.time()
+            for addr, st in peers.items():
+                if st["online"] and (now - st["last_online"] > PRESENCE_TTL):
+                    st["online"] = False
+            # stop idle streams if no subscribers (baseline protected)
+            for key, s in list(streams.sources.items()):
+                if not s.subscribers and s.running:
+                    streams.stop_if_idle(s.stype, s.name)
+    except KeyboardInterrupt:
+        pass
     finally:
-        try: color_grabber.stop()
-        except Exception: pass
-        try:
-            if depth_grabber: depth_grabber.stop()
-        except Exception: pass
-        try: cv2.destroyAllWindows()
-        except Exception: pass
+        for key, s in list(streams.sources.items()):
+            try: s.stop()
+            except Exception: pass
 
-# ──────────────────────────────────────────────────────────────────────
-# 11) main
-# ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
-    print("→ Launching NKN device bridge …")
+    _log("→ Launching NKN device bridge …")
     run()
